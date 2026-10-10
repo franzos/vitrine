@@ -1,0 +1,46 @@
+[package]
+name = "vitrine"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+authors = ["Franz Geffke <mail@gofranz.com>"]
+license = "GPL-3.0-only"
+description = "Read-only image catalog and viewer with optional face recognition"
+repository = "https://github.com/franzos/vitrine"
+readme = "README.md"
+keywords = ["photos", "image-viewer", "catalog", "face-recognition", "egui"]
+categories = ["multimedia::images", "gui"]
+
+[lib]
+# Guix's rust-1.95 ships no rustdoc.
+doctest = false
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+directories = "6.0.0"
+eframe = { version = "0.36.2", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+file-format = "0.29.0"
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp", "gif", "tiff"] }
+jxl-oxide = "0.12.6"
+kamadak-exif = "0.6.1"
+libheif-rs = { version = "3.0.0", default-features = false, features = ["v1_23"] }
+ndarray = "0.17.2"
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["load-dynamic", "ndarray", "api-28", "cuda"] }
+quickraw = "0.1.6"
+rayon = "1.12.0"
+rusqlite = { version = "0.40.2", features = ["bundled", "fallible_uint"] }
+rusqlite_migration = "2.6.0"
+serde = { version = "1.0.229", features = ["derive"] }
+sha2 = "0.11.0"
+thiserror = "2.0.21"
+tiff = "0.11.3"
+toml = "1.1.7"
+turbojpeg = { version = "1.5.1", default-features = false, features = ["pkg-config"] }
+ureq = { version = "3.4.2", default-features = false, features = ["rustls"] }
+walkdir = "2.5.0"
+
+[dev-dependencies]
+assert_cmd = "2.2.2"
+egui_kittest = "0.36.2"
+tempfile = "3.27.0"
