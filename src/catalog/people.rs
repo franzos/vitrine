@@ -1,4 +1,4 @@
-use rusqlite::{Connection, Transaction, params};
+use rusqlite::{Connection, Row, Transaction, params};
 
 use super::faces::{FaceId, ModelId};
 use crate::db::{Error, Result};
@@ -14,6 +14,22 @@ pub struct Person {
     pub faces: u64,
     /// Highest-scoring face, lowest id on ties.
     pub cover: Option<FaceId>,
+}
+
+/// Selects from `people p`; the face count is column 4 of the five.
+pub(crate) const COLUMNS: &str = "p.id, p.name, p.ignored,
+     (SELECT count(*) FROM faces f WHERE f.person_id = p.id),
+     (SELECT f.id FROM faces f WHERE f.person_id = p.id ORDER BY f.score DESC, f.id LIMIT 1)";
+
+/// Reads [`COLUMNS`] starting at column `start`.
+pub(crate) fn from_row(row: &Row<'_>, start: usize) -> rusqlite::Result<Person> {
+    Ok(Person {
+        id: PersonId(row.get(start)?),
+        name: row.get(start + 1)?,
+        ignored: row.get(start + 2)?,
+        faces: row.get(start + 3)?,
+        cover: row.get::<_, Option<i64>>(start + 4)?.map(FaceId),
+    })
 }
 
 pub fn create(conn: &Connection, model: ModelId) -> Result<PersonId> {
@@ -117,23 +133,13 @@ pub fn delete_empty_unnamed(conn: &Connection, model: ModelId) -> Result<usize> 
 
 /// Named by name, then unnamed by face count (most first), ties by id.
 pub fn list(conn: &Connection, model: ModelId) -> Result<Vec<Person>> {
-    let mut stmt = conn.prepare(
-        "SELECT p.id, p.name, p.ignored,
-             (SELECT count(*) FROM faces f WHERE f.person_id = p.id) AS n,
-             (SELECT f.id FROM faces f WHERE f.person_id = p.id ORDER BY f.score DESC, f.id LIMIT 1)
-         FROM people p
+    let sql = format!(
+        "SELECT {COLUMNS} FROM people p
          WHERE p.model_id = ?1
-         ORDER BY p.name IS NULL, p.name, n DESC, p.id",
-    )?;
-    let rows = stmt.query_map([model.0], |row| {
-        Ok(Person {
-            id: PersonId(row.get(0)?),
-            name: row.get(1)?,
-            ignored: row.get(2)?,
-            faces: row.get(3)?,
-            cover: row.get::<_, Option<i64>>(4)?.map(FaceId),
-        })
-    })?;
+         ORDER BY p.name IS NULL, p.name, 4 DESC, p.id"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([model.0], |row| from_row(row, 0))?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 

@@ -8,6 +8,7 @@ use crate::catalog::runs::{self, RunStats};
 use crate::catalog::{self, images};
 use crate::config::{Config, Paths};
 use crate::faces::{cluster, fetch};
+use crate::geo;
 use crate::index;
 use crate::lock::IndexLock;
 
@@ -37,6 +38,11 @@ pub enum Command {
         #[command(subcommand)]
         command: FacesCommand,
     },
+    /// Manage the place gazetteer
+    Geo {
+        #[command(subcommand)]
+        command: GeoCommand,
+    },
     /// Show config, storage locations, catalog counts and the last index run
     Status,
 }
@@ -47,6 +53,15 @@ pub enum FacesCommand {
     Fetch,
     /// Rerun clustering over all faces not assigned by hand
     Recluster,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum GeoCommand {
+    /// Download GeoNames place names and build the gazetteer
+    Fetch {
+        #[arg(long, value_enum, default_value_t)]
+        coverage: geo::fetch::Coverage,
+    },
 }
 
 pub fn run(cli: Cli) -> Result<()> {
@@ -70,6 +85,9 @@ pub fn run(cli: Cli) -> Result<()> {
         Some(Command::Faces {
             command: FacesCommand::Recluster,
         }) => faces_recluster(&paths, &config),
+        Some(Command::Geo {
+            command: GeoCommand::Fetch { coverage },
+        }) => geo_fetch(&paths, coverage),
         Some(Command::Status) => status(&paths, &config),
     }
 }
@@ -131,8 +149,10 @@ fn print_stats(stats: &RunStats) {
         ("faces found", stats.faces_found),
         ("people created", stats.people_created),
         ("faces assigned", stats.faces_assigned),
+        ("gps found", stats.gps_found),
+        ("places resolved", stats.places_resolved),
     ] {
-        println!("  {:<16}{value}", format!("{name}:"));
+        println!("  {:<17}{value}", format!("{name}:"));
     }
 }
 
@@ -184,6 +204,15 @@ fn faces_recluster(paths: &Paths, config: &Config) -> Result<()> {
     Ok(())
 }
 
+fn geo_fetch(paths: &Paths, coverage: geo::fetch::Coverage) -> Result<()> {
+    println!("{}\n", geo::ATTRIBUTION);
+    let path = paths.geo_db();
+    println!("gazetteer: {}", path.display());
+    let places = geo::fetch::fetch(&path, coverage)?;
+    println!("  places: {places}");
+    Ok(())
+}
+
 fn status(paths: &Paths, config: &Config) -> Result<()> {
     println!("config:  {}", paths.config_file.display());
     println!("catalog: {}", paths.catalog_db().display());
@@ -203,6 +232,15 @@ fn status(paths: &Paths, config: &Config) -> Result<()> {
             "disabled"
         }
     );
+    match geo::GeoDb::open(&paths.geo_db()) {
+        Ok(Some(gazetteer)) => println!(
+            "gazetteer: {}, {} places",
+            gazetteer.fetched_at(),
+            gazetteer.count()
+        ),
+        Ok(None) => println!("gazetteer: not fetched; run vitrine geo fetch"),
+        Err(e) => println!("gazetteer: {:#}", anyhow::Error::new(e)),
+    }
     let catalog_db = paths.catalog_db();
     if !catalog_db.exists() {
         println!("indexed: never");
@@ -214,6 +252,10 @@ fn status(paths: &Paths, config: &Config) -> Result<()> {
     println!("videos:  {}", counts.videos);
     println!("missing: {}", counts.missing);
     println!("unhashed: {}", counts.unhashed);
+    let located = catalog::geo::counts(&conn)?;
+    println!("located (exif):   {}", located.exif);
+    println!("located (manual): {}", located.manual);
+    println!("gps pending:      {}", located.pending);
     match runs::last(&conn)? {
         Some(run) => {
             println!("indexed: {}", run.finished_at);
@@ -257,5 +299,24 @@ mod tests {
             })
         ));
         assert_eq!(cli.config, Some(PathBuf::from("/c.toml")));
+        let cli = Cli::try_parse_from(["vitrine", "geo", "fetch"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Geo {
+                command: GeoCommand::Fetch {
+                    coverage: geo::fetch::Coverage::Cities
+                }
+            })
+        ));
+        let cli =
+            Cli::try_parse_from(["vitrine", "geo", "fetch", "--coverage", "islands"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Geo {
+                command: GeoCommand::Fetch {
+                    coverage: geo::fetch::Coverage::Islands
+                }
+            })
+        ));
     }
 }

@@ -22,6 +22,10 @@ pub struct RunStats {
     pub faces_found: u64,
     pub people_created: u64,
     pub faces_assigned: u64,
+    /// Scanned content with EXIF coordinates.
+    pub gps_found: u64,
+    /// EXIF locations written.
+    pub places_resolved: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,8 +39,9 @@ pub fn record(conn: &Connection, stats: &RunStats) -> Result<()> {
     conn.execute(
         "INSERT INTO index_runs
              (files, hashed, added, changed, moved, restored, vanished, failed, thumbnailed,
-              faces_scanned, faces_found, people_created, faces_assigned)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+              faces_scanned, faces_found, people_created, faces_assigned, gps_found,
+              places_resolved)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         params![
             stats.files,
             stats.hashed,
@@ -51,6 +56,8 @@ pub fn record(conn: &Connection, stats: &RunStats) -> Result<()> {
             stats.faces_found,
             stats.people_created,
             stats.faces_assigned,
+            stats.gps_found,
+            stats.places_resolved,
         ],
     )?;
     Ok(())
@@ -61,7 +68,8 @@ pub fn last(conn: &Connection) -> Result<Option<Run>> {
         .query_row(
             "SELECT datetime(finished_at, 'unixepoch', 'localtime'),
                     files, hashed, added, changed, moved, restored, vanished, failed, thumbnailed,
-                    faces_scanned, faces_found, people_created, faces_assigned
+                    faces_scanned, faces_found, people_created, faces_assigned, gps_found,
+                    places_resolved
              FROM index_runs ORDER BY id DESC LIMIT 1",
             [],
             |row| {
@@ -81,6 +89,8 @@ pub fn last(conn: &Connection) -> Result<Option<Run>> {
                         faces_found: row.get(11)?,
                         people_created: row.get(12)?,
                         faces_assigned: row.get(13)?,
+                        gps_found: row.get(14)?,
+                        places_resolved: row.get(15)?,
                     },
                 })
             },
@@ -106,6 +116,8 @@ mod tests {
             faces_found: 5,
             people_created: 1,
             faces_assigned: 4,
+            gps_found: 2,
+            places_resolved: 1,
             ..RunStats::default()
         };
         let second = RunStats {

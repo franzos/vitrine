@@ -30,6 +30,11 @@ impl Paths {
     }
 
     #[must_use]
+    pub fn geo_db(&self) -> PathBuf {
+        self.data_dir.join("geo.db")
+    }
+
+    #[must_use]
     pub fn index_lock(&self) -> PathBuf {
         self.data_dir.join("index.lock")
     }
@@ -42,5 +47,24 @@ impl Paths {
     #[must_use]
     pub fn thumbs_db(&self) -> PathBuf {
         self.cache_dir.join("thumbs.db")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn geo_db_sits_in_data_dir() {
+        let paths = Paths {
+            home_dir: PathBuf::from("/home/test"),
+            config_file: PathBuf::from("/home/test/.config/vitrine/config.toml"),
+            data_dir: PathBuf::from("/home/test/.local/share/vitrine"),
+            cache_dir: PathBuf::from("/home/test/.cache/vitrine"),
+        };
+        assert_eq!(
+            paths.geo_db(),
+            PathBuf::from("/home/test/.local/share/vitrine/geo.db")
+        );
     }
 }

@@ -2,7 +2,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, ErrorCode, OpenFlags};
 use rusqlite_migration::Migrations;
@@ -83,6 +83,13 @@ fn open_and_migrate(path: &Path, migrations: &Migrations) -> Result<Connection> 
         }
     }
     Ok(conn)
+}
+
+/// Milliseconds since the Unix epoch, the unit of `set_at` columns.
+pub(crate) fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
 pub(crate) fn open_read_only(path: &Path) -> Result<Connection> {

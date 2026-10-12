@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
@@ -7,12 +7,14 @@ use std::time::{Duration, Instant};
 use rusqlite::{Connection, Transaction};
 
 use super::faces::Scan;
+use super::geo;
 use super::meta::Meta;
 use super::{Failure, IndexEvent};
 use crate::catalog::faces::{self, NewFace, Rect};
 use crate::catalog::images::{self, Image, ImageId, Kind, NewImage, Status};
 use crate::catalog::runs::{self, RunStats};
-use crate::db::{Result, Sha256};
+use crate::db::{Result, Sha256, now_ms};
+use crate::geo::GeoDb;
 use crate::thumbs::{self, Thumb};
 
 const BATCH_ROWS: usize = 500;
@@ -23,6 +25,7 @@ pub(crate) enum Op {
     Restore { id: ImageId, path: PathBuf },
     Store(Stored),
     Faces(Scan),
+    Gps(geo::Scan),
 }
 
 #[derive(Debug)]
@@ -119,6 +122,73 @@ impl<'c, F: FnMut(&IndexEvent)> Writer<'c, F> {
         Ok(())
     }
 
+    /// Writes an exif location for each scan with coordinates and none yet; `false` when cancelled.
+    /// A lookup error goes to the failures and leaves the rest pending.
+    pub(crate) fn resolve(&mut self, gazetteer: &GeoDb, path: &Path) -> Result<bool> {
+        let set_at = now_ms();
+        let mut after = None;
+        loop {
+            if self.cancel.load(Ordering::Relaxed) {
+                return Ok(false);
+            }
+            let batch = crate::catalog::geo::unresolved(self.conn, after.as_ref(), BATCH_ROWS)?;
+            let Some(&(last, _, _)) = batch.last() else {
+                return Ok(true);
+            };
+            // a scan `nearest` can't place stays unresolved, so paging can't restart from the top
+            after = Some(last);
+            let tx = self.conn.transaction()?;
+            let mut resolved = 0;
+            for (sha256, lat, lon) in &batch {
+                match gazetteer.nearest(*lat, *lon) {
+                    Ok(Some(place)) => {
+                        let written =
+                            crate::catalog::geo::insert_exif(&tx, sha256, &place, set_at)?;
+                        resolved += u64::from(written);
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        drop(tx);
+                        self.fail(geo::failure(path, e));
+                        return Ok(true);
+                    }
+                }
+            }
+            tx.commit()?;
+            self.stats.places_resolved += resolved;
+        }
+    }
+
+    /// Fills in coordinates for catalog places the gazetteer knows; the count written, `None` when
+    /// cancelled. A lookup error goes to the failures and writes nothing.
+    pub(crate) fn backfill_places(
+        &mut self,
+        gazetteer: &GeoDb,
+        path: &Path,
+    ) -> Result<Option<u64>> {
+        if self.cancel.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        let ids = crate::catalog::geo::places_without_coords(self.conn)?;
+        let tx = self.conn.transaction()?;
+        let mut written = 0;
+        for id in ids {
+            match gazetteer.coords(id) {
+                Ok(Some((lat, lon))) => {
+                    written += u64::from(crate::catalog::geo::set_place_coords(&tx, id, lat, lon)?);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    drop(tx);
+                    self.fail(geo::failure(path, e));
+                    return Ok(Some(0));
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(Some(written))
+    }
+
     pub(crate) fn fail(&mut self, failure: Failure) {
         (self.on_event)(&IndexEvent::Failed {
             path: failure.path.clone(),
@@ -173,6 +243,9 @@ impl<'c, F: FnMut(&IndexEvent)> Writer<'c, F> {
                 Op::Faces(scan) => {
                     apply_scan(&tx, scan, &mut self.stats, &mut self.failures, &mut events)?;
                 }
+                Op::Gps(scan) => {
+                    apply_gps(&tx, scan, &mut self.stats, &mut self.failures, &mut events)?;
+                }
             }
         }
         tx.commit()?;
@@ -191,7 +264,7 @@ fn apply_stored(
     failures: &mut Vec<Failure>,
     events: &mut Vec<IndexEvent>,
 ) -> Result<()> {
-    if stored.kind == Kind::Image {
+    if stored.kind == Kind::Image || stored.sha256.is_some() {
         stats.hashed += 1;
     }
     if !stored.thumbs.is_empty() {
@@ -235,6 +308,8 @@ fn apply_stored(
             width,
             height,
             taken_at: stored.meta.taken_at.as_deref(),
+            duration_ms: stored.meta.duration_ms,
+            codec: stored.meta.codec.as_deref(),
         },
     )?;
     let path = stored.path;
@@ -292,6 +367,39 @@ fn apply_scan(
         sha256: scan.sha256,
         path: scan.path,
         faces: scan.faces.map_or(0, |f| f.len()),
+    });
+    Ok(())
+}
+
+fn apply_gps(
+    tx: &Transaction<'_>,
+    scan: geo::Scan,
+    stats: &mut RunStats,
+    failures: &mut Vec<Failure>,
+    events: &mut Vec<IndexEvent>,
+) -> Result<()> {
+    let found = match scan.gps {
+        Ok(gps) => {
+            crate::catalog::geo::insert_scan(tx, &scan.sha256, gps)?;
+            stats.gps_found += u64::from(gps.is_some());
+            gps.is_some()
+        }
+        Err(error) => {
+            failures.push(Failure {
+                path: scan.path.clone(),
+                error: error.clone(),
+            });
+            events.push(IndexEvent::Failed {
+                path: scan.path.clone(),
+                error,
+            });
+            false
+        }
+    };
+    events.push(IndexEvent::GeoScanned {
+        sha256: scan.sha256,
+        path: scan.path,
+        found,
     });
     Ok(())
 }

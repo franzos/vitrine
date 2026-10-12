@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use assert_cmd::cargo::cargo_bin_cmd;
 use rusqlite::{Connection, OptionalExtension};
@@ -27,6 +28,8 @@ const IMAGES: u64 = 11;
 struct Env {
     dir: TempDir,
     tree: PathBuf,
+    /// Runs with the real `PATH` instead of an empty one.
+    tools: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -52,12 +55,25 @@ impl Env {
         }
         fs::write(tree.join("2025/clip.mp4"), b"not really a video").unwrap();
         fs::write(tree.join("2025/notes.txt"), b"skipped").unwrap();
-        let env = Self { dir, tree };
+        let env = Self {
+            dir,
+            tree,
+            tools: false,
+        };
         if with_root {
             let config = env.home().join(".config/vitrine/config.toml");
             fs::create_dir_all(config.parent().unwrap()).unwrap();
             fs::write(config, format!("roots = [\"{}\"]\n", env.tree.display())).unwrap();
         }
+        env
+    }
+
+    /// Like `new(true)` with a real `clip.mp4` and the real `PATH`.
+    fn with_ffmpeg() -> Self {
+        let mut env = Self::new(true);
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        fs::copy(fixtures.join("clip.mp4"), env.tree.join("2025/clip.mp4")).unwrap();
+        env.tools = true;
         env
     }
 
@@ -69,9 +85,15 @@ impl Env {
         self.home().join(".local/share/vitrine")
     }
 
+    /// Without `tools`, runs with an empty `PATH`, so `clip.mp4` stays an unhashed placeholder.
     fn vitrine(&self, args: &[&str]) -> assert_cmd::Command {
         let home = self.home();
         let mut cmd = cargo_bin_cmd!("vitrine");
+        if !self.tools {
+            let bin = self.dir.path().join("bin");
+            fs::create_dir_all(&bin).unwrap();
+            cmd.env("PATH", bin);
+        }
         cmd.args(args)
             .env("HOME", &home)
             .env("XDG_CONFIG_HOME", home.join(".config"))
@@ -114,6 +136,17 @@ impl Env {
             },
         )
         .optional()
+        .unwrap()
+    }
+
+    /// `(duration_ms, codec)` of the row at `rel`.
+    fn video_meta(&self, rel: &str) -> (Option<u64>, Option<String>) {
+        let conn = Connection::open(self.data_dir().join("catalog.db")).unwrap();
+        conn.query_row(
+            "SELECT duration_ms, codec FROM images WHERE path = ?1",
+            [self.tree.join(rel).to_str().unwrap()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
         .unwrap()
     }
 
@@ -200,6 +233,22 @@ fn fields(stdout: &[u8]) -> HashMap<String, String> {
         .collect()
 }
 
+/// Whether `ffprobe` and `ffmpeg` run from `PATH`; prints why a gated test is skipped when they don't.
+fn ffmpeg_present() -> bool {
+    let missing = ["ffprobe", "ffmpeg"].into_iter().find(|program| {
+        !Command::new(program)
+            .arg("-version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    });
+    if let Some(program) = missing {
+        eprintln!("skipping: {program} not found");
+    }
+    missing.is_none()
+}
+
 fn count(fields: &HashMap<String, String>, key: &str) -> u64 {
     fields
         .get(key)
@@ -217,7 +266,7 @@ fn first_index_catalogues_images_and_videos() {
     assert_eq!(count(&run, "files"), IMAGES + 1);
     assert_eq!(count(&run, "hashed"), IMAGES);
     assert_eq!(count(&run, "added"), IMAGES + 1);
-    assert_eq!(count(&run, "failed"), 0);
+    assert_eq!(count(&run, "failed"), 1);
     assert_eq!(count(&run, "thumbnailed"), IMAGES);
 
     let thumbs = env.thumbs();
@@ -231,6 +280,7 @@ fn first_index_catalogues_images_and_videos() {
     assert_eq!(count(&status, "videos"), 1);
     assert_eq!(count(&status, "missing"), 0);
     assert_eq!(count(&status, "hashed"), IMAGES);
+    assert_eq!(count(&status, "unhashed"), 1);
     assert!(status.contains_key("indexed"));
 
     for (_, rel) in &LAYOUT[..LAYOUT.len() - 1] {
@@ -285,13 +335,98 @@ fn moved_file_without_thumbnails_gets_them() {
 }
 
 #[test]
-fn changed_video_is_not_hashed() {
+fn video_without_tools_stays_a_placeholder() {
     let env = Env::new(true);
-    env.index(&[]);
+    let output = env
+        .vitrine(&["index"])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("clip.mp4: video: ffprobe not found; videos are not thumbnailed"),
+        "{stderr}"
+    );
+
+    let run = env.index(&[]);
+    assert_eq!((count(&run, "changed"), count(&run, "failed")), (0, 1));
+
     fs::write(env.tree.join("2025/clip.mp4"), b"a longer fake video").unwrap();
     let run = env.index(&[]);
     assert_eq!(count(&run, "changed"), 1);
     assert_eq!(count(&run, "hashed"), 0);
+    assert_eq!(count(&run, "failed"), 1);
+    let video = env.row("2025/clip.mp4").unwrap();
+    assert_eq!((video.kind.as_str(), video.sha256), ("video", None));
+}
+
+#[test]
+fn first_index_with_ffmpeg_thumbnails_the_video() {
+    if !ffmpeg_present() {
+        return;
+    }
+    let env = Env::with_ffmpeg();
+    let before = env.snapshot();
+
+    let run = env.index(&[]);
+    assert_eq!(count(&run, "files"), IMAGES + 1);
+    assert_eq!(count(&run, "hashed"), IMAGES + 1);
+    assert_eq!(count(&run, "failed"), 0);
+    assert_eq!(count(&run, "thumbnailed"), IMAGES + 1);
+
+    let video = env.row("2025/clip.mp4").unwrap();
+    assert_eq!(video.kind, "video");
+    assert_eq!((video.width, video.height), (Some(72), Some(56)));
+    assert_eq!(
+        env.video_meta("2025/clip.mp4"),
+        (Some(1000), Some("h264".to_owned()))
+    );
+    assert_eq!(env.thumbs()[&video.sha256.unwrap()], [256, 512]);
+    assert_eq!(count(&env.status(), "unhashed"), 0);
+    assert_eq!(env.snapshot(), before);
+}
+
+#[test]
+fn video_indexed_without_tools_is_upgraded_with_them() {
+    if !ffmpeg_present() {
+        return;
+    }
+    let mut env = Env::with_ffmpeg();
+    env.tools = false;
+    let run = env.index(&[]);
+    assert_eq!(count(&run, "failed"), 1);
+    assert_eq!(env.row("2025/clip.mp4").unwrap().sha256, None);
+
+    env.tools = true;
+    let run = env.index(&[]);
+    assert_eq!(count(&run, "changed"), 1);
+    assert_eq!(count(&run, "hashed"), 1);
+    assert_eq!(count(&run, "thumbnailed"), 1);
+    assert_eq!(count(&run, "failed"), 0);
+    let video = env.row("2025/clip.mp4").unwrap();
+    assert_eq!((video.width, video.height), (Some(72), Some(56)));
+    assert_eq!(env.thumbs()[&video.sha256.unwrap()], [256, 512]);
+}
+
+#[test]
+fn changed_video_that_fails_to_probe_keeps_a_hash_but_no_thumbnails() {
+    if !ffmpeg_present() {
+        return;
+    }
+    let env = Env::with_ffmpeg();
+    env.index(&[]);
+    let original = env.row("2025/clip.mp4").unwrap().sha256.unwrap();
+
+    fs::write(env.tree.join("2025/clip.mp4"), b"no longer a real video").unwrap();
+    let run = env.index(&[]);
+    assert_eq!(count(&run, "changed"), 1);
+    assert_eq!(count(&run, "hashed"), 1);
+    assert_eq!(count(&run, "failed"), 1);
+    assert_eq!(count(&run, "thumbnailed"), 0);
+    let sha256 = env.row("2025/clip.mp4").unwrap().sha256.unwrap();
+    assert_ne!(sha256, original);
+    assert!(!env.thumbs().contains_key(&sha256));
 }
 
 #[test]
@@ -431,7 +566,7 @@ fn unreadable_header_is_recorded_once() {
         .get_output()
         .clone();
     let run = fields(&output.stdout);
-    assert_eq!(count(&run, "failed"), 1);
+    assert_eq!(count(&run, "failed"), 2);
     assert_eq!(count(&run, "thumbnailed"), IMAGES);
     assert!(String::from_utf8_lossy(&output.stderr).contains("broken.jpg"));
     let row = env.row("2024/broken.jpg").unwrap();
@@ -439,5 +574,50 @@ fn unreadable_header_is_recorded_once() {
     assert_eq!((row.width, row.height), (None, None));
 
     let run = env.index(&[]);
-    assert_eq!((count(&run, "hashed"), count(&run, "failed")), (0, 0));
+    assert_eq!((count(&run, "hashed"), count(&run, "failed")), (0, 1));
+}
+
+#[test]
+fn gps_resolves_against_the_gazetteer() {
+    const ADMIN1: &str = "PT.14\tLisbon\tLisbon\t2267056\nPT.17\tPorto\tPorto\t2735941\n";
+    const COUNTRIES: &str = "PT\tPRT\t620\tPO\tPortugal\tLisbon\n";
+    const CITIES: &str = "\
+2267057\tLisbon\tLisbon\tLisboa\t38.71667\t-9.13333\tP\tPPLC\tPT\t\t14\t\t\t\t517802\t\t45\tEurope/Lisbon\t2024-01-01
+2735943\tPorto\tPorto\t\t41.14961\t-8.61099\tP\tPPLA\tPT\t\t17\t\t\t\t249633\t\t104\tEurope/Lisbon\t2024-01-01
+";
+    let env = Env::new(true);
+    fs::create_dir_all(env.tree.join("2026")).unwrap();
+    fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/gps.jpg"),
+        env.tree.join("2026/gps.jpg"),
+    )
+    .unwrap();
+    let status = env.status();
+    assert_eq!(
+        status["gazetteer"], "not fetched; run vitrine geo fetch",
+        "{status:?}"
+    );
+
+    fs::create_dir_all(env.data_dir()).unwrap();
+    let places = vitrine::geo::build(
+        &env.data_dir().join("geo.db"),
+        vec![vitrine::geo::Rows::all("cities1000.txt", CITIES.as_bytes())],
+        ADMIN1.as_bytes(),
+        COUNTRIES.as_bytes(),
+        1,
+    )
+    .unwrap();
+    assert_eq!(places, 2);
+
+    let run = env.index(&[]);
+    assert_eq!(count(&run, "failed"), 1);
+    let status = env.status();
+    assert_eq!(count(&status, "located (exif)"), 1);
+    assert_eq!(count(&status, "located (manual)"), 0);
+    assert_eq!(count(&status, "gps pending"), 0);
+    assert_eq!(count(&status, "gps found"), 1);
+    assert_eq!(count(&status, "places resolved"), 1);
+    let gazetteer = &status["gazetteer"];
+    assert!(gazetteer.ends_with(", 2 places"), "{gazetteer}");
+    assert_eq!(gazetteer.len(), "2026-10-11 12:00:00, 2 places".len());
 }

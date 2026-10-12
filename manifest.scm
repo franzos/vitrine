@@ -10,6 +10,7 @@
              (gnu packages gl)
              (gnu packages freedesktop)
              (gnu packages xdisorg)
+             (gnu packages video)
              (gnu packages vulkan))
 
 (define openssl-with-dir
@@ -69,4 +70,5 @@
        mesa-with-library-path
        wayland
        libxkbcommon
-       vulkan-loader))
+       vulkan-loader
+       ffmpeg))

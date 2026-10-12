@@ -1,14 +1,14 @@
-//! Entries below a folder, narrowed by their faces.
+//! Entries and map points below a folder, narrowed by faces, places and area.
 
 use std::path::Path;
 
-use rusqlite::Connection;
 use rusqlite::types::Value;
+use rusqlite::{Connection, OptionalExtension};
 
 use super::faces::ModelId;
-use super::images::{Entry, entry_from_row, prefix_range};
+use super::images::{Entry, ImageId, entry_from_row, prefix_range};
 use super::people::PersonId;
-use crate::db::{Result, path_str};
+use crate::db::{Result, Sha256, path_str};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum FaceCount {
@@ -41,10 +41,24 @@ impl FaceCount {
     }
 }
 
+/// Content located at the selected place, through `locations` and the catalog's `places`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PlaceSel {
+    /// ISO 3166-1 alpha-2.
+    pub country: Option<String>,
+    /// GeoNames admin1 code; ignored without `country`, since codes repeat across countries.
+    pub region: Option<String>,
+    /// GeoNames id.
+    pub city: Option<i64>,
+    /// Images, not videos, with no place, "no location" markers included; combined with a place it matches nothing.
+    pub none: bool,
+}
+
 /// A face counts when it isn't marked not-a-face, scores at least `min_score`, and both box sides are at least `min_face_size`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Filter {
-    pub model: ModelId,
+    /// Face criteria apply only with a model.
+    pub model: Option<ModelId>,
     pub min_score: f32,
     pub min_face_size: u32,
     /// Content scanned with `model` with this many counted faces; [`FaceCount::Any`] also keeps unscanned content and videos.
@@ -53,17 +67,103 @@ pub struct Filter {
     pub people: Vec<PersonId>,
     /// Content with a counted face that has no person, or an unnamed, non-ignored one.
     pub unknown: bool,
+    pub place: PlaceSel,
+    /// Images whose point lies inside, bounds included.
+    pub area: Option<Area>,
 }
+
+/// Latitudes `south..=north`, longitudes `west..=east`; never crosses the antimeridian.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Area {
+    pub south: f64,
+    pub north: f64,
+    pub west: f64,
+    pub east: f64,
+}
+
+const COORD_JOINS: &str = " LEFT JOIN locations ml ON ml.sha256 = i.sha256
+         LEFT JOIN places mp ON mp.geoname_id = ml.place_id
+         LEFT JOIN geo_scans gs ON gs.sha256 = i.sha256";
+// A manual place without coordinates yields NULL rather than falling back to EXIF.
+const LAT: &str = "CASE WHEN ml.source = 'manual' THEN mp.lat ELSE gs.lat END";
+const LON: &str = "CASE WHEN ml.source = 'manual' THEN mp.lon ELSE gs.lon END";
 
 /// Any depth below `folder`, path order.
 pub fn entries(conn: &Connection, folder: &Path, filter: &Filter) -> Result<Vec<Entry>> {
-    let (lower, upper) = prefix_range(path_str(folder)?);
-    let mut sql = String::from(
-        "SELECT i.id, i.path, i.sha256, i.kind, i.width, i.height FROM images i
-         WHERE i.path >= ? AND i.path < ? AND i.status = 'active'",
+    let (sql, params) = entries_sql(folder, filter)?;
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(params), entry_from_row)?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+fn entries_sql(folder: &Path, filter: &Filter) -> Result<(String, Vec<Value>)> {
+    let (from, params) = base(folder, filter, false)?;
+    Ok((
+        format!(
+            "SELECT i.id, i.path, i.sha256, i.kind, i.width, i.height, i.duration_ms {from} ORDER BY i.path"
+        ),
+        params,
+    ))
+}
+
+/// Located images below `folder` as `(id, lat, lon)`, path order; a manual place wins over EXIF.
+pub fn points(
+    conn: &Connection,
+    folder: &Path,
+    filter: &Filter,
+) -> Result<Vec<(ImageId, f64, f64)>> {
+    let (from, params) = base(folder, filter, true)?;
+    let sql = format!(
+        "SELECT i.id, {LAT}, {LON} {from}
+         AND i.kind = 'image' AND {LAT} IS NOT NULL AND {LON} IS NOT NULL ORDER BY i.path"
     );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(params), |row| {
+        Ok((ImageId(row.get(0)?), row.get(1)?, row.get(2)?))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// The `(lat, lon)` [`points`] gives active images of this content.
+pub fn point_of(conn: &Connection, sha256: &Sha256) -> Result<Option<(f64, f64)>> {
+    Ok(conn
+        .query_row(
+            &format!(
+                "SELECT {LAT}, {LON} FROM images i{COORD_JOINS}
+                 WHERE i.sha256 = ?1 AND i.status = 'active' AND i.kind = 'image'
+                   AND {LAT} IS NOT NULL AND {LON} IS NOT NULL
+                 LIMIT 1"
+            ),
+            [sha256],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?)
+}
+
+/// `FROM ... WHERE ...` for `filter` below `folder`; `coords` adds the joins `LAT` and `LON` read.
+fn base(folder: &Path, filter: &Filter, coords: bool) -> Result<(String, Vec<Value>)> {
+    let (lower, upper) = prefix_range(path_str(folder)?);
+    let mut sql = String::from("FROM images i");
+    if coords || filter.area.is_some() {
+        sql.push_str(COORD_JOINS);
+    }
+    sql.push_str("\n         WHERE i.path >= ? AND i.path < ? AND i.status = 'active'");
     let mut params = vec![Value::Text(lower), Value::Text(upper)];
-    let model = Value::Integer(filter.model.0);
+    if let Some(model) = filter.model {
+        faces_sql(&mut sql, &mut params, model, filter);
+    }
+    place_sql(&mut sql, &mut params, &filter.place);
+    if let Some(area) = filter.area {
+        sql.push_str(&format!(
+            " AND {LAT} BETWEEN ? AND ? AND {LON} BETWEEN ? AND ?"
+        ));
+        params.extend([area.south, area.north, area.west, area.east].map(Value::Real));
+    }
+    Ok((sql, params))
+}
+
+fn faces_sql(sql: &mut String, params: &mut Vec<Value>, model: ModelId, filter: &Filter) {
+    let model = Value::Integer(model.0);
     let counted = |params: &mut Vec<Value>| {
         params.extend([
             model.clone(),
@@ -87,7 +187,7 @@ pub fn entries(conn: &Connection, folder: &Path, filter: &Filter) -> Result<Vec<
         FaceCount::ThreeOrMore => Some(">= 3"),
     };
     if let Some(compare) = compare {
-        let counted = counted(&mut params);
+        let counted = counted(params);
         sql.push_str(&format!(
             " AND (SELECT count(*) FROM faces f WHERE f.sha256 = i.sha256 AND {counted}) {compare}"
         ));
@@ -107,17 +207,40 @@ pub fn entries(conn: &Connection, folder: &Path, filter: &Filter) -> Result<Vec<
     }
 
     if filter.unknown {
-        let counted = counted(&mut params);
+        let counted = counted(params);
         sql.push_str(&format!(
             " AND i.sha256 IN (SELECT f.sha256 FROM faces f LEFT JOIN people p ON p.id = f.person_id
               WHERE {counted} AND (f.person_id IS NULL OR (p.name IS NULL AND p.ignored = 0)))"
         ));
     }
-    sql.push_str(" ORDER BY i.path");
+}
 
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(rusqlite::params_from_iter(params), entry_from_row)?;
-    Ok(rows.collect::<rusqlite::Result<_>>()?)
+fn place_sql(sql: &mut String, params: &mut Vec<Value>, place: &PlaceSel) {
+    let mut at = String::new();
+    if let Some(country) = &place.country {
+        at.push_str(" AND p.country_code = ?");
+        params.push(Value::Text(country.clone()));
+        if let Some(region) = &place.region {
+            at.push_str(" AND p.region_code = ?");
+            params.push(Value::Text(region.clone()));
+        }
+    }
+    if let Some(city) = place.city {
+        at.push_str(" AND l.place_id = ?");
+        params.push(Value::Integer(city));
+    }
+    if !at.is_empty() {
+        sql.push_str(&format!(
+            " AND EXISTS (SELECT 1 FROM locations l JOIN places p ON p.geoname_id = l.place_id
+              WHERE l.sha256 = i.sha256{at})"
+        ));
+    }
+    if place.none {
+        sql.push_str(
+            " AND i.kind = 'image' AND NOT EXISTS
+              (SELECT 1 FROM locations l WHERE l.sha256 = i.sha256 AND l.place_id IS NOT NULL)",
+        );
+    }
 }
 
 #[cfg(test)]
@@ -127,8 +250,9 @@ mod tests {
     use super::*;
     use crate::catalog::faces::{self, AssignedBy, FaceId, NewFace, Rect, register_model};
     use crate::catalog::images::{self, Kind, NewImage};
-    use crate::catalog::{edit, people, temp};
+    use crate::catalog::{edit, geo, people, temp};
     use crate::db::Sha256;
+    use crate::geo::Place;
 
     fn image(conn: &Connection, path: &str, sha: Option<Sha256>, kind: Kind) {
         images::upsert(
@@ -142,6 +266,8 @@ mod tests {
                 width: None,
                 height: None,
                 taken_at: None,
+                duration_ms: None,
+                codec: None,
             },
         )
         .unwrap();
@@ -176,12 +302,14 @@ mod tests {
 
     fn filter(model: ModelId) -> Filter {
         Filter {
-            model,
+            model: Some(model),
             min_score: 0.6,
             min_face_size: 40,
             count: FaceCount::Any,
             people: Vec::new(),
             unknown: false,
+            place: PlaceSel::default(),
+            area: None,
         }
     }
 
@@ -405,6 +533,417 @@ mod tests {
         assert!(people::list(&lib.conn, lib.model).unwrap().is_empty());
     }
 
+    fn place(geoname_id: i64, name: &str, region_code: &str, country_code: &str) -> Place {
+        Place {
+            geoname_id,
+            name: name.to_owned(),
+            region_code: region_code.to_owned(),
+            region: format!("region {region_code}"),
+            country_code: country_code.to_owned(),
+            country: format!("country {country_code}"),
+            coords: None,
+        }
+    }
+
+    fn sel(country: Option<&str>, region: Option<&str>, city: Option<i64>, none: bool) -> PlaceSel {
+        PlaceSel {
+            country: country.map(str::to_owned),
+            region: region.map(str::to_owned),
+            city,
+            none,
+        }
+    }
+
+    /// Located images in PT and FR, where region `11` exists in both, plus a marker, an unlocated and an unhashed image, a video and a missing image.
+    fn places() -> (tempfile::TempDir, Connection) {
+        let (dir, mut conn) = temp();
+        let located = [
+            ("/p/lisbon.jpg", place(1, "Lisbon", "14", "PT")),
+            ("/p/q/lisbon-copy.jpg", place(1, "Lisbon", "14", "PT")),
+            ("/p/sintra.jpg", place(2, "Sintra", "14", "PT")),
+            ("/p/porto.jpg", place(3, "Porto", "17", "PT")),
+            ("/p/guarda.jpg", place(4, "Guarda", "11", "PT")),
+            ("/p/paris.jpg", place(5, "Paris", "11", "FR")),
+        ];
+        for (n, (path, _)) in located.iter().enumerate() {
+            image(
+                &conn,
+                path,
+                Some([u8::try_from(n).unwrap(); 32]),
+                Kind::Image,
+            );
+        }
+        image(&conn, "/p/marker.jpg", Some([100; 32]), Kind::Image);
+        image(&conn, "/p/unlocated.jpg", Some([101; 32]), Kind::Image);
+        image(&conn, "/p/unhashed.jpg", None, Kind::Image);
+        image(&conn, "/p/video.mp4", None, Kind::Video);
+        image(&conn, "/p/gone.jpg", Some([102; 32]), Kind::Image);
+        conn.execute(
+            "UPDATE images SET status = 'missing' WHERE path = '/p/gone.jpg'",
+            [],
+        )
+        .unwrap();
+        edit(&mut conn, |tx| {
+            for (n, (_, at)) in located.iter().enumerate() {
+                geo::set_manual(tx, &[u8::try_from(n).unwrap(); 32], at, 10)?;
+            }
+            geo::insert_exif(tx, &[102; 32], &place(1, "Lisbon", "14", "PT"), 10)?;
+            geo::clear(tx, &[100; 32], 10)
+        });
+        (dir, conn)
+    }
+
+    fn placed(conn: &Connection, place: PlaceSel) -> Vec<String> {
+        names(
+            conn,
+            "/p",
+            &Filter {
+                model: None,
+                place,
+                ..filter(ModelId(0))
+            },
+        )
+    }
+
+    #[test]
+    fn place_filter_narrows_by_country_region_and_city() {
+        let (_dir, conn) = places();
+        assert_eq!(
+            placed(&conn, sel(Some("PT"), None, None, false)),
+            [
+                "guarda.jpg",
+                "lisbon.jpg",
+                "porto.jpg",
+                "q/lisbon-copy.jpg",
+                "sintra.jpg"
+            ]
+        );
+        assert_eq!(
+            placed(&conn, sel(Some("PT"), Some("14"), None, false)),
+            ["lisbon.jpg", "q/lisbon-copy.jpg", "sintra.jpg"]
+        );
+        assert_eq!(
+            placed(&conn, sel(Some("PT"), Some("14"), Some(2), false)),
+            ["sintra.jpg"]
+        );
+        assert_eq!(
+            placed(&conn, sel(None, None, Some(1), false)),
+            ["lisbon.jpg", "q/lisbon-copy.jpg"]
+        );
+        assert!(placed(&conn, sel(Some("FR"), None, Some(1), false)).is_empty());
+        assert!(placed(&conn, sel(Some("ES"), None, None, false)).is_empty());
+        assert_eq!(
+            names(
+                &conn,
+                "/p/q",
+                &Filter {
+                    model: None,
+                    place: sel(Some("PT"), None, None, false),
+                    ..filter(ModelId(0))
+                }
+            ),
+            ["q/lisbon-copy.jpg"]
+        );
+        assert_eq!(placed(&conn, PlaceSel::default()).len(), 10);
+        assert_eq!(placed(&conn, sel(None, Some("14"), None, false)).len(), 10);
+    }
+
+    #[test]
+    fn region_codes_are_scoped_to_their_country() {
+        let (_dir, conn) = places();
+        assert_eq!(
+            placed(&conn, sel(Some("PT"), Some("11"), None, false)),
+            ["guarda.jpg"]
+        );
+        assert_eq!(
+            placed(&conn, sel(Some("FR"), Some("11"), None, false)),
+            ["paris.jpg"]
+        );
+    }
+
+    #[test]
+    fn no_location_keeps_images_without_a_place() {
+        let (_dir, conn) = places();
+        assert_eq!(
+            placed(&conn, sel(None, None, None, true)),
+            ["marker.jpg", "unhashed.jpg", "unlocated.jpg"]
+        );
+        assert!(placed(&conn, sel(Some("PT"), None, None, true)).is_empty());
+        assert!(placed(&conn, sel(None, None, Some(1), true)).is_empty());
+    }
+
+    #[test]
+    fn place_and_face_filters_combine() {
+        let mut lib = library();
+        edit(&mut lib.conn, |tx| {
+            geo::set_manual(tx, &[2; 32], &place(1, "Lisbon", "14", "PT"), 10)?;
+            geo::set_manual(tx, &[3; 32], &place(5, "Paris", "11", "FR"), 10)
+        });
+        let with = |count, place, model| {
+            names(
+                &lib.conn,
+                "/p",
+                &Filter {
+                    count,
+                    place,
+                    model,
+                    ..filter(lib.model)
+                },
+            )
+        };
+        let pt = || sel(Some("PT"), None, None, false);
+        assert_eq!(with(FaceCount::Any, pt(), Some(lib.model)), ["a/1.jpg"]);
+        assert_eq!(with(FaceCount::One, pt(), Some(lib.model)), ["a/1.jpg"]);
+        assert!(with(FaceCount::Two, pt(), Some(lib.model)).is_empty());
+        assert_eq!(
+            with(FaceCount::One, sel(None, None, None, true), Some(lib.model)),
+            ["b/0.jpg"]
+        );
+        assert_eq!(with(FaceCount::Two, pt(), None), ["a/1.jpg"]);
+        assert_eq!(with(FaceCount::One, PlaceSel::default(), None).len(), 9);
+    }
+
+    #[test]
+    fn entries_sql_matches_the_single_query_builder() {
+        let old = |folder: &str, filter: &Filter| {
+            let (lower, upper) = prefix_range(folder);
+            let mut sql = String::from(
+                "SELECT i.id, i.path, i.sha256, i.kind, i.width, i.height, i.duration_ms FROM images i
+         WHERE i.path >= ? AND i.path < ? AND i.status = 'active'",
+            );
+            let mut params = vec![Value::Text(lower), Value::Text(upper)];
+            if let Some(model) = filter.model {
+                faces_sql(&mut sql, &mut params, model, filter);
+            }
+            place_sql(&mut sql, &mut params, &filter.place);
+            sql.push_str(" ORDER BY i.path");
+            (sql, params)
+        };
+        let full = Filter {
+            count: FaceCount::Zero,
+            people: vec![PersonId(2), PersonId(1)],
+            unknown: true,
+            place: sel(Some("PT"), Some("14"), Some(1), true),
+            ..filter(ModelId(3))
+        };
+        for f in [
+            filter(ModelId(3)),
+            Filter {
+                model: None,
+                ..full.clone()
+            },
+            full,
+        ] {
+            assert_eq!(entries_sql(Path::new("/p"), &f).unwrap(), old("/p", &f));
+        }
+    }
+
+    const LISBON: (f64, f64) = (38.7223, -9.1393);
+    const SCAN: (f64, f64) = (38.71, -9.15);
+    const PORTO: (f64, f64) = (41.1579, -8.6291);
+    const PARIS: (f64, f64) = (48.8566, 2.3522);
+
+    /// EXIF-located, manual, marker, manual without coordinates, unresolved, no GPS, video and missing content, plus a copy; `a/exif.jpg` and its copy have one face.
+    fn located() -> (tempfile::TempDir, Connection, ModelId) {
+        let (dir, mut conn) = temp();
+        let model = register_model(&conn, "m", "d", 2).unwrap();
+        type Row<'a> = (&'a str, u8, Kind, Option<(f64, f64)>);
+        let rows: [Row; 9] = [
+            ("/p/a/exif.jpg", 1, Kind::Image, Some(SCAN)),
+            ("/p/a/manual.jpg", 2, Kind::Image, Some(SCAN)),
+            ("/p/a/marker.jpg", 3, Kind::Image, Some(SCAN)),
+            ("/p/a/nocoords.jpg", 4, Kind::Image, Some(SCAN)),
+            ("/p/b/unresolved.jpg", 5, Kind::Image, Some(PARIS)),
+            ("/p/b/nogps.jpg", 6, Kind::Image, None),
+            ("/p/b/video.mp4", 7, Kind::Video, Some(PARIS)),
+            ("/p/b/gone.jpg", 8, Kind::Image, Some(PARIS)),
+            ("/p/c/copy.jpg", 1, Kind::Image, Some(SCAN)),
+        ];
+        for (path, n, kind, _) in rows {
+            image(&conn, path, Some([n; 32]), kind);
+        }
+        conn.execute(
+            "UPDATE images SET status = 'missing' WHERE path = '/p/b/gone.jpg'",
+            [],
+        )
+        .unwrap();
+        let coords = |p: Place, at| Place {
+            coords: Some(at),
+            ..p
+        };
+        edit(&mut conn, |tx| {
+            for (path, n, _, gps) in rows {
+                if path != "/p/c/copy.jpg" {
+                    geo::insert_scan(tx, &[n; 32], gps)?;
+                }
+            }
+            geo::insert_exif(
+                tx,
+                &[1; 32],
+                &coords(place(1, "Lisbon", "14", "PT"), LISBON),
+                10,
+            )?;
+            geo::insert_exif(
+                tx,
+                &[2; 32],
+                &coords(place(1, "Lisbon", "14", "PT"), LISBON),
+                10,
+            )?;
+            geo::set_manual(
+                tx,
+                &[2; 32],
+                &coords(place(3, "Porto", "17", "PT"), PORTO),
+                10,
+            )?;
+            geo::insert_exif(
+                tx,
+                &[3; 32],
+                &coords(place(1, "Lisbon", "14", "PT"), LISBON),
+                10,
+            )?;
+            geo::clear(tx, &[3; 32], 10)?;
+            geo::set_manual(tx, &[4; 32], &place(9, "Nowhere", "01", "PT"), 10)?;
+            geo::set_manual(
+                tx,
+                &[8; 32],
+                &coords(place(5, "Paris", "11", "FR"), PARIS),
+                10,
+            )
+        });
+        scan(&mut conn, [1; 32], model, &[BIG]);
+        scan(&mut conn, [2; 32], model, &[]);
+        (dir, conn, model)
+    }
+
+    fn pointed(conn: &Connection, folder: &str, filter: &Filter) -> Vec<(String, f64, f64)> {
+        points(conn, Path::new(folder), filter)
+            .unwrap()
+            .into_iter()
+            .map(|(id, lat, lon)| {
+                let path: String = conn
+                    .query_row("SELECT path FROM images WHERE id = ?1", [id.0], |r| {
+                        r.get(0)
+                    })
+                    .unwrap();
+                (path.strip_prefix("/p/").unwrap().to_owned(), lat, lon)
+            })
+            .collect()
+    }
+
+    fn unfiltered() -> Filter {
+        Filter {
+            model: None,
+            ..filter(ModelId(0))
+        }
+    }
+
+    #[test]
+    fn points_take_manual_places_over_exif_and_skip_unlocated() {
+        let (_dir, conn, _) = located();
+        let p = |name: &str, (lat, lon): (f64, f64)| (name.to_owned(), lat, lon);
+        assert_eq!(
+            pointed(&conn, "/p", &unfiltered()),
+            [
+                p("a/exif.jpg", SCAN),
+                p("a/manual.jpg", PORTO),
+                p("b/unresolved.jpg", PARIS),
+                p("c/copy.jpg", SCAN),
+            ]
+        );
+        assert_eq!(
+            pointed(&conn, "/p/b", &unfiltered()),
+            [p("b/unresolved.jpg", PARIS)]
+        );
+    }
+
+    #[test]
+    fn point_of_agrees_with_points() {
+        let (_dir, conn, _) = located();
+        assert_eq!(point_of(&conn, &[1; 32]).unwrap(), Some(SCAN));
+        assert_eq!(point_of(&conn, &[2; 32]).unwrap(), Some(PORTO));
+        assert_eq!(point_of(&conn, &[5; 32]).unwrap(), Some(PARIS));
+        for n in [3, 4, 6, 7, 8, 99] {
+            assert_eq!(point_of(&conn, &[n; 32]).unwrap(), None, "content {n}");
+        }
+        for (id, lat, lon) in points(&conn, Path::new("/p"), &unfiltered()).unwrap() {
+            let sha: Sha256 = conn
+                .query_row("SELECT sha256 FROM images WHERE id = ?1", [id.0], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(point_of(&conn, &sha).unwrap(), Some((lat, lon)));
+        }
+    }
+
+    #[test]
+    fn area_bounds_are_inclusive_and_combine_with_other_filters() {
+        let (_dir, conn, model) = located();
+        let around = |(lat, lon): (f64, f64)| Area {
+            south: lat,
+            north: lat,
+            west: lon,
+            east: lon,
+        };
+        let portugal = Area {
+            south: 37.0,
+            north: 42.0,
+            west: -10.0,
+            east: -6.0,
+        };
+        let within = |area, f: Filter| {
+            names(
+                &conn,
+                "/p",
+                &Filter {
+                    area: Some(area),
+                    ..f
+                },
+            )
+        };
+        assert_eq!(within(around(PORTO), unfiltered()), ["a/manual.jpg"]);
+        assert_eq!(
+            within(around(SCAN), unfiltered()),
+            ["a/exif.jpg", "c/copy.jpg"]
+        );
+        assert_eq!(
+            within(portugal, unfiltered()),
+            ["a/exif.jpg", "a/manual.jpg", "c/copy.jpg"]
+        );
+        assert_eq!(
+            within(
+                portugal,
+                Filter {
+                    place: sel(Some("PT"), Some("17"), None, false),
+                    ..unfiltered()
+                }
+            ),
+            ["a/manual.jpg"]
+        );
+        assert_eq!(
+            within(
+                portugal,
+                Filter {
+                    count: FaceCount::One,
+                    ..filter(model)
+                }
+            ),
+            ["a/exif.jpg", "c/copy.jpg"]
+        );
+        assert!(within(around(LISBON), unfiltered()).is_empty());
+        assert_eq!(
+            pointed(
+                &conn,
+                "/p/a",
+                &Filter {
+                    area: Some(portugal),
+                    count: FaceCount::Zero,
+                    ..filter(model)
+                }
+            ),
+            [("a/manual.jpg".to_owned(), PORTO.0, PORTO.1)]
+        );
+    }
+
     /// 50k synthetic images; run with `--ignored --nocapture`.
     #[test]
     #[ignore = "benchmark"]
@@ -426,6 +965,21 @@ mod tests {
             )
             .unwrap();
         }
+        for id in 0..60_i64 {
+            tx.execute(
+                "INSERT INTO places (geoname_id, name, region_code, region, country_code, country, lat, lon)
+                 VALUES (?1, ?2, ?3, ?3, ?4, ?4, ?5, ?6)",
+                rusqlite::params![
+                    id + 1,
+                    format!("city {id}"),
+                    format!("{:02}", id / 5 % 4),
+                    ["PT", "FR", "DE"][usize::try_from(id / 20).unwrap()],
+                    f64::from(u8::try_from(id).unwrap()).mul_add(0.3, 35.0),
+                    f64::from(u8::try_from(id).unwrap()).mul_add(0.4, -10.0),
+                ],
+            )
+            .unwrap();
+        }
         let mut face = 0_usize;
         for n in 0..IMAGES {
             let mut sha = [0_u8; 32];
@@ -441,6 +995,23 @@ mod tests {
                 rusqlite::params![sha, model.0],
             )
             .unwrap();
+            if n % 5 != 0 {
+                let k = f64::from(u32::try_from(n % 1000).unwrap());
+                tx.execute(
+                    "INSERT INTO geo_scans (sha256, lat, lon) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![sha, k.mul_add(0.02, 35.0), k.mul_add(0.03, -10.0)],
+                )
+                .unwrap();
+                tx.execute(
+                    "INSERT INTO locations (sha256, place_id, source, set_at) VALUES (?1, ?2, ?3, 0)",
+                    rusqlite::params![
+                        sha,
+                        i64::try_from(n % 60).unwrap() + 1,
+                        if n % 7 == 0 { "manual" } else { "exif" },
+                    ],
+                )
+                .unwrap();
+            }
             for _ in 0..[0, 0, 0, 1, 1, 1, 2, 2, 3, 5][n % 10] {
                 face += 1;
                 let person =
@@ -522,13 +1093,68 @@ mod tests {
                     ..base.clone()
                 },
             ),
+            (
+                "country",
+                Filter {
+                    place: sel(Some("FR"), None, None, false),
+                    ..base.clone()
+                },
+            ),
+            (
+                "region",
+                Filter {
+                    place: sel(Some("FR"), Some("02"), None, false),
+                    ..base.clone()
+                },
+            ),
+            (
+                "city",
+                Filter {
+                    place: sel(Some("FR"), Some("02"), Some(32), false),
+                    ..base.clone()
+                },
+            ),
+            (
+                "no location",
+                Filter {
+                    place: sel(None, None, None, true),
+                    ..base.clone()
+                },
+            ),
+            (
+                "area",
+                Filter {
+                    area: Some(Area {
+                        south: 40.0,
+                        north: 50.0,
+                        west: 0.0,
+                        east: 20.0,
+                    }),
+                    ..base.clone()
+                },
+            ),
+            (
+                "place+person",
+                Filter {
+                    people: vec![PersonId(1)],
+                    place: sel(Some("PT"), None, None, false),
+                    ..base.clone()
+                },
+            ),
         ];
         let root = PathBuf::from("/lib");
         for (name, f) in &cases {
             entries(&conn, &root, f).unwrap();
             let started = Instant::now();
             let n = entries(&conn, &root, f).unwrap().len();
-            println!("{name:<12} {n:>6} entries {:?}", started.elapsed());
+            let took = started.elapsed();
+            points(&conn, &root, f).unwrap();
+            let started = Instant::now();
+            let p = points(&conn, &root, f).unwrap().len();
+            println!(
+                "{name:<12} {n:>6} entries {took:?}, {p:>6} points {:?}",
+                started.elapsed()
+            );
         }
         let started = Instant::now();
         let n = people::list(&conn, model).unwrap().len();

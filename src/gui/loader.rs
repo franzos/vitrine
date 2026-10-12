@@ -9,6 +9,7 @@ use std::thread;
 use eframe::egui::{ColorImage, Context};
 use turbojpeg::PixelFormat;
 
+use crate::catalog::images::Kind;
 use crate::db::Sha256;
 use crate::thumbs;
 
@@ -18,6 +19,7 @@ pub type Key = (Sha256, u32);
 pub struct Request {
     pub key: Key,
     pub path: PathBuf,
+    pub kind: Kind,
 }
 
 pub struct Loaded {
@@ -97,6 +99,11 @@ impl Loader {
         let state = self.shared.lock();
         state.queue.len() + state.working.len()
     }
+
+    #[cfg(test)]
+    pub fn queued(&self) -> usize {
+        self.shared.lock().queue.len()
+    }
 }
 
 impl Drop for Loader {
@@ -128,8 +135,9 @@ fn work(shared: &Shared, thumbs_db: &Path, tx: &Sender<Loaded>) {
         let image = panic::catch_unwind(AssertUnwindSafe(|| {
             conn.as_ref().map_err(Clone::clone).and_then(|conn| {
                 let (sha256, bucket) = &request.key;
-                let thumb = thumbs::generate::ensure(conn, &request.path, sha256, *bucket)
-                    .map_err(|e| error_chain(&e))?;
+                let thumb =
+                    thumbs::generate::ensure(conn, &request.path, sha256, *bucket, request.kind)
+                        .map_err(|e| error_chain(&e))?;
                 decode(&thumb.jpeg).map_err(|e| e.to_string())
             })
         }))

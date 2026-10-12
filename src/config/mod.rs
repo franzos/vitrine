@@ -33,6 +33,10 @@ pub enum ConfigError {
     MinScore(f32),
     #[error("viewer.external must name a command")]
     EmptyExternal,
+    #[error("viewer.player must name a command")]
+    EmptyPlayer,
+    #[error("geo.event_gap_hours must be at least 1")]
+    EventGapHours,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -40,6 +44,7 @@ pub enum ConfigError {
 pub struct Config {
     pub roots: Vec<PathBuf>,
     pub faces: Faces,
+    pub geo: Geo,
     pub viewer: Viewer,
 }
 
@@ -82,17 +87,33 @@ pub enum Device {
     Cuda,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Geo {
+    /// Largest gap between two capture times that keeps them in one event.
+    pub event_gap_hours: u32,
+}
+
+impl Default for Geo {
+    fn default() -> Self {
+        Self { event_gap_hours: 6 }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Viewer {
     /// Command and leading arguments; image paths are appended.
     pub external: Vec<String>,
+    /// Command and leading arguments; the video path is appended.
+    pub player: Vec<String>,
 }
 
 impl Default for Viewer {
     fn default() -> Self {
         Self {
             external: vec!["oculante".to_owned()],
+            player: vec!["xdg-open".to_owned()],
         }
     }
 }
@@ -138,8 +159,14 @@ impl Config {
         if !(SCORE_THRESHOLD..=1.0).contains(&min_score) {
             return Err(ConfigError::MinScore(min_score));
         }
+        if self.geo.event_gap_hours == 0 {
+            return Err(ConfigError::EventGapHours);
+        }
         if self.viewer.external.first().is_none_or(String::is_empty) {
             return Err(ConfigError::EmptyExternal);
+        }
+        if self.viewer.player.first().is_none_or(String::is_empty) {
+            return Err(ConfigError::EmptyPlayer);
         }
         Ok(self)
     }
@@ -178,7 +205,9 @@ mod tests {
         assert!((config.faces.merge_threshold - 0.25).abs() < f32::EPSILON);
         assert!((config.faces.min_score - 0.5).abs() < f32::EPSILON);
         assert_eq!(config.faces.min_face_size, 40);
+        assert_eq!(config.geo.event_gap_hours, 6);
         assert_eq!(config.viewer.external, ["oculante"]);
+        assert_eq!(config.viewer.player, ["xdg-open"]);
     }
 
     #[test]
@@ -207,6 +236,7 @@ mod tests {
 
             [viewer]
             external = ["imv", "-f"]
+            player = ["mpv", "--fs"]
             "#,
         )
         .unwrap();
@@ -225,6 +255,7 @@ mod tests {
         assert!((config.faces.min_score - 0.7).abs() < f32::EPSILON);
         assert_eq!(config.faces.min_face_size, 24);
         assert_eq!(config.viewer.external, ["imv", "-f"]);
+        assert_eq!(config.viewer.player, ["mpv", "--fs"]);
     }
 
     #[test]
@@ -295,10 +326,29 @@ mod tests {
     }
 
     #[test]
+    fn event_gap_hours_parses_and_rejects_zero() {
+        let config = parse("[geo]\nevent_gap_hours = 12\n").unwrap();
+        assert_eq!(config.geo.event_gap_hours, 12);
+        assert!(matches!(
+            parse("[geo]\nevent_gap_hours = 0\n"),
+            Err(ConfigError::EventGapHours)
+        ));
+        assert!(toml::from_str::<Config>("[geo]\nevent_gap = 6\n").is_err());
+    }
+
+    #[test]
     fn empty_external_rejected() {
         for bad in ["[]", r#"[""]"#] {
             let text = format!("[viewer]\nexternal = {bad}\n");
             assert!(matches!(parse(&text), Err(ConfigError::EmptyExternal)));
+        }
+    }
+
+    #[test]
+    fn empty_player_rejected() {
+        for bad in ["[]", r#"[""]"#] {
+            let text = format!("[viewer]\nplayer = {bad}\n");
+            assert!(matches!(parse(&text), Err(ConfigError::EmptyPlayer)));
         }
     }
 

@@ -89,6 +89,8 @@ pub fn fetch_files<'a>(
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_connect(Some(Duration::from_secs(30)))
         .timeout_recv_response(Some(Duration::from_secs(60)))
+        // without it a stalled transfer blocks forever
+        .timeout_recv_body(Some(Duration::from_secs(1800)))
         .build()
         .into();
     files

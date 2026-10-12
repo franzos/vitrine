@@ -4,6 +4,7 @@ use std::borrow::Cow;
 use std::fs::{self, File};
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 
 use anyhow::Context;
 use image::imageops::FilterType;
@@ -13,7 +14,9 @@ use rusqlite::Connection;
 use turbojpeg::{Decompressor, PixelFormat, ScalingFactor, Subsamp};
 
 use super::Thumb;
+use crate::catalog::images::Kind;
 use crate::db::Sha256;
+use crate::video::Tools;
 
 pub const BUCKETS: [u32; 2] = [256, 512];
 
@@ -99,13 +102,26 @@ pub fn generate_with(
     Ok(out)
 }
 
-/// On a miss, makes and stores every missing bucket in [`BUCKETS`].
+/// On a miss, makes and stores every missing bucket in [`BUCKETS`]; videos take their frame from the system ffmpeg.
 /// Safe to call from several threads, each with its own connection.
 pub fn ensure(
     conn: &Connection,
     path: &Path,
     sha256: &Sha256,
     bucket: u32,
+    kind: Kind,
+) -> Result<Thumb, Error> {
+    ensure_with(&Tools::SYSTEM, conn, path, sha256, bucket, kind)
+}
+
+/// Like [`ensure`], with `tools` providing video frames.
+pub fn ensure_with(
+    tools: &Tools,
+    conn: &Connection,
+    path: &Path,
+    sha256: &Sha256,
+    bucket: u32,
+    kind: Kind,
 ) -> Result<Thumb, Error> {
     if let Some(thumb) = super::get(conn, sha256, bucket)? {
         return Ok(thumb);
@@ -113,7 +129,16 @@ pub fn ensure(
     let stored = super::buckets(conn, sha256)?;
     let mut wanted = vec![bucket];
     wanted.extend(BUCKETS.iter().filter(|b| !stored.contains(b)));
-    let generated = generate(path, &wanted).map_err(|e| Error::Generate {
+    let generated = match kind {
+        Kind::Image => generate(path, &wanted),
+        Kind::Video => {
+            static NEVER: AtomicBool = AtomicBool::new(false);
+            generate_with(path, &wanted, |path| {
+                Ok(tools.thumbnail_frame(path, &NEVER)?)
+            })
+        }
+    }
+    .map_err(|e| Error::Generate {
         path: path.to_owned(),
         source: e.into(),
     })?;
@@ -411,18 +436,57 @@ mod tests {
         let key = sha256(&path);
 
         let conn = super::super::open(&db).unwrap();
-        let thumb = ensure(&conn, &path, &key, 512).unwrap();
+        let thumb = ensure(&conn, &path, &key, 512, Kind::Image).unwrap();
         assert_eq!((thumb.width, thumb.height), (384, 512));
         assert_eq!(super::super::buckets(&conn, &key).unwrap(), BUCKETS);
 
         // served from the cache: the file isn't read again
         let moved = dir.path().join("gone.jpg");
-        let cached = ensure(&conn, &moved, &key, 256).unwrap();
+        let cached = ensure(&conn, &moved, &key, 256, Kind::Image).unwrap();
         assert_eq!((cached.width, cached.height), (192, 256));
         assert!(matches!(
-            ensure(&conn, &moved, &[0; 32], 256),
+            ensure(&conn, &moved, &[0; 32], 256, Kind::Image),
             Err(Error::Generate { .. })
         ));
+    }
+
+    #[test]
+    fn ensure_video_stores_every_bucket() {
+        if !crate::video::tools_present() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = fixture("clip.mp4");
+        let key = sha256(&path);
+        let conn = super::super::open(&dir.path().join("thumbs.db")).unwrap();
+        let thumb = ensure(&conn, &path, &key, 256, Kind::Video).unwrap();
+        assert_eq!((thumb.width, thumb.height), (72, 56));
+        assert_eq!(super::super::buckets(&conn, &key).unwrap(), BUCKETS);
+    }
+
+    #[test]
+    fn ensure_video_names_the_missing_program() {
+        let tools = Tools {
+            ffprobe: "/nonexistent/ffprobe",
+            ffmpeg: "/nonexistent/ffmpeg",
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = fixture("clip.mp4");
+        let conn = super::super::open(&dir.path().join("thumbs.db")).unwrap();
+        let Err(Error::Generate { source, .. }) =
+            ensure_with(&tools, &conn, &path, &sha256(&path), 256, Kind::Video)
+        else {
+            panic!("expected a generate error");
+        };
+        assert!(
+            source.to_string().contains("/nonexistent/ffmpeg"),
+            "{source}"
+        );
+        assert!(
+            super::super::buckets(&conn, &sha256(&path))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -436,7 +500,7 @@ mod tests {
                 s.spawn(move || {
                     let conn = super::super::open(db).unwrap();
                     let path = fixture(name);
-                    let thumb = ensure(&conn, &path, &sha256(&path), 256).unwrap();
+                    let thumb = ensure(&conn, &path, &sha256(&path), 256, Kind::Image).unwrap();
                     assert_eq!(
                         (thumb.width, thumb.height),
                         expected(*original, 256),

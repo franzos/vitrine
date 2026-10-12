@@ -67,9 +67,14 @@ pub enum Action {
 
 #[must_use]
 pub fn label(person: &Person) -> String {
+    format!("{} ({})", name(person), person.faces)
+}
+
+#[must_use]
+pub fn name(person: &Person) -> String {
     match &person.name {
-        Some(name) => format!("{name} ({})", person.faces),
-        None => format!("unnamed #{} ({})", person.id.0, person.faces),
+        Some(name) => name.clone(),
+        None => format!("unnamed #{}", person.id.0),
     }
 }
 
@@ -118,6 +123,10 @@ impl PeoplePanel {
     #[must_use]
     pub fn people(&self) -> &[Person] {
         &self.people
+    }
+
+    pub fn crops(&mut self) -> &mut Crops {
+        &mut self.crops
     }
 
     #[cfg(test)]
@@ -199,14 +208,19 @@ impl PeoplePanel {
                 }
             });
         if let Some(id) = clicked {
-            self.error = None;
-            let mut open = Open::new(id);
-            match faces::of_person(conn, id) {
-                Ok(faces) => open.faces = faces,
-                Err(e) => self.error = Some(e.to_string()),
-            }
-            self.open = Some(open);
+            self.open(conn, id);
         }
+    }
+
+    /// Opens `id`; a failed face lookup opens it without faces and sets the error.
+    pub fn open(&mut self, conn: &Connection, id: PersonId) {
+        self.error = None;
+        let mut open = Open::new(id);
+        match faces::of_person(conn, id) {
+            Ok(faces) => open.faces = faces,
+            Err(e) => self.error = Some(e.to_string()),
+        }
+        self.open = Some(open);
     }
 
     fn show_person(&mut self, ui: &mut egui::Ui, filtered: &BTreeSet<PersonId>) -> Option<Action> {
@@ -334,7 +348,7 @@ impl PeoplePanel {
 }
 
 /// Draws the crop of `face` in a `size` square; empty while loading, failed or `None`.
-fn crop(ui: &mut egui::Ui, crops: &mut Crops, face: Option<FaceId>, size: f32) {
+pub(super) fn crop(ui: &mut egui::Ui, crops: &mut Crops, face: Option<FaceId>, size: f32) {
     let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
     let texture = face.and_then(|face| crops.get(ui.ctx(), face));
     match texture {
@@ -350,5 +364,28 @@ fn crop(ui: &mut egui::Ui, crops: &mut Crops, face: Option<FaceId>, size: f32) {
             ui.painter()
                 .rect_filled(rect, 4.0, ui.visuals().extreme_bg_color);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn person(id: i64, name: Option<&str>) -> Person {
+        Person {
+            id: PersonId(id),
+            name: name.map(str::to_owned),
+            ignored: false,
+            faces: 3,
+            cover: None,
+        }
+    }
+
+    #[test]
+    fn name_omits_face_count() {
+        assert_eq!(name(&person(7, Some("Ada"))), "Ada");
+        assert_eq!(name(&person(7, None)), "unnamed #7");
+        assert_eq!(label(&person(7, Some("Ada"))), "Ada (3)");
+        assert_eq!(label(&person(7, None)), "unnamed #7 (3)");
     }
 }

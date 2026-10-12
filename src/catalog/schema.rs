@@ -12,6 +12,12 @@
 //! - `faces.landmarks`: 5 `(x, y)` pairs. `faces.embedding`: the model's vector. Both little-endian `f32`.
 //! - `people.created_at`, `index_runs.finished_at`: seconds since the Unix epoch.
 //! - `face_models.clustered_to`: highest face id of that model the last clustering pass saw; a pass runs when a newer face exists.
+//! - `places`: the catalog's copy of each GeoNames place it uses, keyed by GeoNames id, so tags outlive `geo.db`.
+//! - `places.lat`, `places.lon`: the GeoNames coordinates; null until known.
+//! - `geo_scans`: content whose EXIF GPS was read; null coordinates when it had none.
+//! - `locations`: one per content. `exif` rows come from indexing and never replace a row; `manual` rows win. A null `place_id` is a manual "no location" marker.
+//! - `locations.set_at`: milliseconds since the Unix epoch.
+//! - `images.duration_ms`, `images.codec`: video duration and codec name; null for images.
 
 use rusqlite_migration::{M, Migrations};
 
@@ -122,6 +128,49 @@ const M0007_DROP_FACES_BY_SHA256: &str = r"
 DROP INDEX faces_by_sha256;
 ";
 
+const M0008_GEO: &str = r"
+CREATE TABLE places (
+    geoname_id   INTEGER PRIMARY KEY,
+    name         TEXT    NOT NULL,
+    region_code  TEXT    NOT NULL,
+    region       TEXT    NOT NULL,
+    country_code TEXT    NOT NULL,
+    country      TEXT    NOT NULL
+);
+
+CREATE INDEX places_by_region ON places(country_code, region_code);
+
+CREATE TABLE geo_scans (
+    sha256 BLOB NOT NULL PRIMARY KEY CHECK (length(sha256) = 32),
+    lat    REAL,
+    lon    REAL,
+    CHECK ((lat IS NULL) = (lon IS NULL))
+) WITHOUT ROWID;
+
+CREATE TABLE locations (
+    sha256   BLOB    NOT NULL PRIMARY KEY CHECK (length(sha256) = 32),
+    place_id INTEGER REFERENCES places(geoname_id),
+    source   TEXT    NOT NULL CHECK (source IN ('exif', 'manual')),
+    set_at   INTEGER NOT NULL,
+    CHECK (place_id IS NOT NULL OR source = 'manual')
+) WITHOUT ROWID;
+
+CREATE INDEX locations_by_place_id ON locations(place_id);
+
+ALTER TABLE index_runs ADD COLUMN gps_found INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE index_runs ADD COLUMN places_resolved INTEGER NOT NULL DEFAULT 0;
+";
+
+const M0009_PLACE_COORDS: &str = r"
+ALTER TABLE places ADD COLUMN lat REAL;
+ALTER TABLE places ADD COLUMN lon REAL;
+";
+
+const M0010_VIDEO_META: &str = r"
+ALTER TABLE images ADD COLUMN duration_ms INTEGER;
+ALTER TABLE images ADD COLUMN codec TEXT;
+";
+
 pub(crate) fn migrations() -> Migrations<'static> {
     Migrations::new(vec![
         M::up(M0001_INITIAL),
@@ -131,6 +180,9 @@ pub(crate) fn migrations() -> Migrations<'static> {
         M::up(M0005_CLUSTERING),
         M::up(M0006_FACE_FILTERS),
         M::up(M0007_DROP_FACES_BY_SHA256),
+        M::up(M0008_GEO),
+        M::up(M0009_PLACE_COORDS),
+        M::up(M0010_VIDEO_META),
     ])
 }
 
@@ -175,6 +227,18 @@ mod tests {
                 "M0007_DROP_FACES_BY_SHA256",
                 "b8eee8c3bda08047bf4ad886a9f2f01b22a0dc77a75bac99087707b39524ed3a",
             ),
+            (
+                "M0008_GEO",
+                "08a845927ba887580dc7a03b037b74665f4f803cf1486e3cb972aa9938c12389",
+            ),
+            (
+                "M0009_PLACE_COORDS",
+                "55d553c8f161186fde542eb3bf2436a63e710c14d74d7662896b3413d4d3b1f7",
+            ),
+            (
+                "M0010_VIDEO_META",
+                "13d87a42e61ee7e329ff927efa4593ab4655c7b318131b6bf9963a78c19e7279",
+            ),
         ];
         let sources: &[(&str, &str)] = &[
             ("M0001_INITIAL", M0001_INITIAL),
@@ -184,6 +248,9 @@ mod tests {
             ("M0005_CLUSTERING", M0005_CLUSTERING),
             ("M0006_FACE_FILTERS", M0006_FACE_FILTERS),
             ("M0007_DROP_FACES_BY_SHA256", M0007_DROP_FACES_BY_SHA256),
+            ("M0008_GEO", M0008_GEO),
+            ("M0009_PLACE_COORDS", M0009_PLACE_COORDS),
+            ("M0010_VIDEO_META", M0010_VIDEO_META),
         ];
         assert_eq!(
             sources.len(),

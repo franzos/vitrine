@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use rusqlite::types::{FromSql, FromSqlResult, ToSqlOutput, ValueRef};
@@ -9,7 +10,7 @@ use crate::db::{Result, Sha256, path_str};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ImageId(pub i64);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Kind {
     Image,
     Video,
@@ -31,6 +32,8 @@ pub struct NewImage<'a> {
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub taken_at: Option<&'a str>,
+    pub duration_ms: Option<u64>,
+    pub codec: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +48,8 @@ pub struct Image {
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub taken_at: Option<String>,
+    pub duration_ms: Option<u64>,
+    pub codec: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -55,7 +60,8 @@ pub struct Counts {
     pub unhashed: u64,
 }
 
-const COLUMNS: &str = "id, path, size, mtime_ns, sha256, kind, status, width, height, taken_at";
+const COLUMNS: &str =
+    "id, path, size, mtime_ns, sha256, kind, status, width, height, taken_at, duration_ms, codec";
 
 fn from_row(row: &Row<'_>) -> rusqlite::Result<Image> {
     Ok(Image {
@@ -69,17 +75,21 @@ fn from_row(row: &Row<'_>) -> rusqlite::Result<Image> {
         width: row.get(7)?,
         height: row.get(8)?,
         taken_at: row.get(9)?,
+        duration_ms: row.get(10)?,
+        codec: row.get(11)?,
     })
 }
 
 pub fn upsert(conn: &Connection, image: &NewImage<'_>) -> Result<ImageId> {
     let id = conn.query_row(
-        "INSERT INTO images (path, size, mtime_ns, sha256, kind, status, width, height, taken_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?7, ?8)
+        "INSERT INTO images (path, size, mtime_ns, sha256, kind, status, width, height, taken_at,
+                             duration_ms, codec)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?7, ?8, ?9, ?10)
          ON CONFLICT (path) DO UPDATE SET
              size = excluded.size, mtime_ns = excluded.mtime_ns, sha256 = excluded.sha256,
              kind = excluded.kind, status = 'active', width = excluded.width,
-             height = excluded.height, taken_at = excluded.taken_at
+             height = excluded.height, taken_at = excluded.taken_at,
+             duration_ms = excluded.duration_ms, codec = excluded.codec
          RETURNING id",
         params![
             path_str(image.path)?,
@@ -90,10 +100,17 @@ pub fn upsert(conn: &Connection, image: &NewImage<'_>) -> Result<ImageId> {
             image.width,
             image.height,
             image.taken_at,
+            image.duration_ms,
+            image.codec,
         ],
         |row| row.get(0),
     )?;
     Ok(ImageId(id))
+}
+
+pub fn get(conn: &Connection, id: ImageId) -> Result<Option<Image>> {
+    let sql = format!("SELECT {COLUMNS} FROM images WHERE id = ?1");
+    Ok(conn.query_row(&sql, [id.0], from_row).optional()?)
 }
 
 pub fn get_by_path(conn: &Connection, path: &Path) -> Result<Option<Image>> {
@@ -150,19 +167,46 @@ pub struct Entry {
     pub kind: Kind,
     pub width: Option<u32>,
     pub height: Option<u32>,
+    pub duration_ms: Option<u64>,
 }
 
 pub fn entries_under(conn: &Connection, folder: &Path) -> Result<Vec<Entry>> {
     let (lower, upper) = prefix_range(path_str(folder)?);
     let mut stmt = conn.prepare(
-        "SELECT id, path, sha256, kind, width, height FROM images
+        "SELECT id, path, sha256, kind, width, height, duration_ms FROM images
          WHERE path >= ?1 AND path < ?2 AND status = 'active' ORDER BY path",
     )?;
     let rows = stmt.query_map([lower, upper], entry_from_row)?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
-/// Expects columns `id, path, sha256, kind, width, height` in that order.
+/// Active rows among `ids`, path order.
+pub fn entries_by_id(conn: &Connection, ids: &[ImageId]) -> Result<Vec<Entry>> {
+    let mut stmt = conn.prepare(
+        "SELECT i.id, i.path, i.sha256, i.kind, i.width, i.height, i.duration_ms
+         FROM json_each(?1) j JOIN images i ON i.id = j.value
+         WHERE i.status = 'active' ORDER BY i.path",
+    )?;
+    let rows = stmt.query_map([id_array(ids)], entry_from_row)?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// `ids` as a JSON array for `json_each`.
+pub(crate) fn id_array(ids: &[ImageId]) -> String {
+    let mut array = String::with_capacity(2 + ids.len() * 8);
+    array.push('[');
+    for (i, id) in ids.iter().enumerate() {
+        if i > 0 {
+            array.push(',');
+        }
+        // writing to a String can't fail
+        _ = write!(array, "{}", id.0);
+    }
+    array.push(']');
+    array
+}
+
+/// Expects columns `id, path, sha256, kind, width, height, duration_ms` in that order.
 pub(crate) fn entry_from_row(row: &Row<'_>) -> rusqlite::Result<Entry> {
     Ok(Entry {
         id: ImageId(row.get(0)?),
@@ -171,6 +215,7 @@ pub(crate) fn entry_from_row(row: &Row<'_>) -> rusqlite::Result<Entry> {
         kind: row.get(3)?,
         width: row.get(4)?,
         height: row.get(5)?,
+        duration_ms: row.get(6)?,
     })
 }
 
@@ -210,7 +255,7 @@ pub fn counts(conn: &Connection) -> Result<Counts> {
              count(*) FILTER (WHERE status = 'active' AND kind = 'image'),
              count(*) FILTER (WHERE status = 'active' AND kind = 'video'),
              count(*) FILTER (WHERE status = 'missing'),
-             count(*) FILTER (WHERE sha256 IS NULL AND kind = 'image')
+             count(*) FILTER (WHERE sha256 IS NULL)
          FROM images",
         [],
         |row| {
@@ -289,6 +334,8 @@ mod tests {
             width: None,
             height: None,
             taken_at: None,
+            duration_ms: None,
+            codec: None,
         }
     }
 
@@ -322,9 +369,46 @@ mod tests {
                 width: Some(4000),
                 height: Some(3000),
                 taken_at: Some("2024-05-01T10:11:12".to_owned()),
+                duration_ms: None,
+                codec: None,
             }
         );
         assert!(get_by_path(&conn, Path::new("/p/b.jpg")).unwrap().is_none());
+    }
+
+    #[test]
+    fn upsert_round_trips_video_meta_into_image_and_entry() {
+        let (_dir, conn) = temp();
+        let mut video = new("/p/a.mp4");
+        video.kind = Kind::Video;
+        video.duration_ms = Some(83_250);
+        video.codec = Some("h264");
+        let id = upsert(&conn, &video).unwrap();
+
+        let got = get(&conn, id).unwrap().unwrap();
+        assert_eq!(got.duration_ms, Some(83_250));
+        assert_eq!(got.codec.as_deref(), Some("h264"));
+        let entries = entries_under(&conn, Path::new("/p")).unwrap();
+        assert_eq!(entries[0].duration_ms, Some(83_250));
+        assert_eq!(
+            entries_by_id(&conn, &[id]).unwrap()[0].duration_ms,
+            Some(83_250)
+        );
+
+        video.duration_ms = None;
+        video.codec = None;
+        upsert(&conn, &video).unwrap();
+        let got = get(&conn, id).unwrap().unwrap();
+        assert_eq!((got.duration_ms, got.codec), (None, None));
+    }
+
+    #[test]
+    fn get_by_id() {
+        let (_dir, conn) = temp();
+        upsert(&conn, &new("/p/a.jpg")).unwrap();
+        let id = upsert(&conn, &new("/p/b.jpg")).unwrap();
+        assert_eq!(get(&conn, id).unwrap().unwrap().path, Path::new("/p/b.jpg"));
+        assert!(get(&conn, ImageId(999)).unwrap().is_none());
     }
 
     #[test]
@@ -426,6 +510,21 @@ mod tests {
     }
 
     #[test]
+    fn entries_by_id_keeps_active_rows_in_path_order() {
+        let (_dir, conn) = temp();
+        let ids: Vec<_> = ["/q/b.jpg", "/p/z.jpg", "/p/gone.jpg", "/p/a.jpg"]
+            .into_iter()
+            .map(|path| upsert(&conn, &new(path)).unwrap())
+            .collect();
+        set_status(&conn, ids[2], Status::Missing).unwrap();
+        let entries = entries_by_id(&conn, &[ids[0], ids[1], ids[2], ImageId(999)]).unwrap();
+        let got: Vec<_> = entries.iter().map(|e| e.path.to_str().unwrap()).collect();
+        assert_eq!(got, ["/p/z.jpg", "/q/b.jpg"]);
+        assert_eq!(entries[0].id, ids[1]);
+        assert!(entries_by_id(&conn, &[]).unwrap().is_empty());
+    }
+
+    #[test]
     fn under_uses_path_index() {
         let (_dir, conn) = temp();
         let plan: String = conn
@@ -455,7 +554,7 @@ mod tests {
                 images: 1,
                 videos: 1,
                 missing: 1,
-                unhashed: 1,
+                unhashed: 2,
             }
         );
     }

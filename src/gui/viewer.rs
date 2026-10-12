@@ -8,14 +8,21 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{
-    self, Align, Align2, Color32, FontId, Key, Layout, Pos2, Rect, Sense, TextureHandle, UiBuilder,
-    Vec2, pos2, vec2,
+    self, Align, Align2, Color32, FontId, Key, Layout, Panel, Popup, Pos2, Rect, Sense, Stroke,
+    StrokeKind, TextureHandle, UiBuilder, Vec2, pos2, vec2,
 };
 use eframe::{egui_glow, glow};
 use image::DynamicImage;
 
 use super::grid::Grid;
+use super::info_panel::{self, Info};
+use super::place_picker::{Pick, PlacePicker};
+use crate::catalog::faces;
+use crate::catalog::geo::Location;
 use crate::catalog::images::{Entry, ImageId, Kind};
+use crate::catalog::people::PersonId;
+use crate::db::Sha256;
+use crate::geo::{GeoDb, Place};
 use crate::nav::NavSet;
 use crate::prefetch::{Decode, Limits, Prefetcher};
 use crate::render::{self, GlowRenderer, GlowTile, TexFormat, TileRegion};
@@ -27,15 +34,33 @@ const EXTERNAL_WINDOW: usize = 500;
 const UPLOAD_BUDGET: Duration = Duration::from_millis(8);
 const MIN_SCALE: f32 = 0.01;
 const MAX_SCALE: f32 = 64.0;
+const BAR: f32 = 28.0;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Action {
     Close,
+    /// For the image under the cursor.
+    Locate(Pick),
+    /// Shows the image under the cursor at its map point.
+    ShowOnMap,
+    OpenPerson(PersonId),
+}
+
+/// The location shown in the bottom bar and the Info panel.
+pub struct Places<'a> {
+    /// `None` without `geo.db`, which leaves the location read-only.
+    pub gazetteer: Option<&'a GeoDb>,
+    /// The stored location of the content with this hash.
+    pub location: Option<&'a (Sha256, Option<Location>)>,
+    /// The map point of the content in `location`.
+    pub coords: Option<(f64, f64)>,
+    pub recent: &'a [Place],
 }
 
 pub struct Viewer {
     open: bool,
     external: Vec<String>,
+    player: Vec<String>,
     prefetcher: Option<Prefetcher>,
     /// `None` until the first frame with a GL context.
     renderer: Option<Result<GlowRenderer, String>>,
@@ -46,6 +71,8 @@ pub struct Viewer {
     message: Option<String>,
     /// Failures of actions that run on their own thread, shown in the overlay.
     notices: (Sender<String>, Receiver<String>),
+    picker: PlacePicker,
+    info_open: bool,
 }
 
 /// Tiles are uploaded a few per frame.
@@ -76,10 +103,11 @@ enum View {
 
 impl Viewer {
     #[must_use]
-    pub fn new(external: Vec<String>) -> Self {
+    pub fn new(external: Vec<String>, player: Vec<String>) -> Self {
         Self {
             open: false,
             external,
+            player,
             prefetcher: None,
             renderer: None,
             upload: None,
@@ -88,12 +116,19 @@ impl Viewer {
             wanted: None,
             message: None,
             notices: mpsc::channel(),
+            picker: PlacePicker::default(),
+            info_open: false,
         }
     }
 
     #[must_use]
     pub fn is_open(&self) -> bool {
         self.open
+    }
+
+    #[must_use]
+    pub fn info_open(&self) -> bool {
+        self.info_open
     }
 
     pub fn open(&mut self) {
@@ -118,6 +153,8 @@ impl Viewer {
         nav: &mut NavSet,
         grid: &mut Grid,
         gl: Option<&glow::Context>,
+        places: &Places<'_>,
+        info: &mut Info<'_>,
     ) -> Option<Action> {
         if let Some(gl) = gl
             && self.renderer.is_none()
@@ -167,7 +204,23 @@ impl Viewer {
             }
         }
 
-        let rect = ui.max_rect();
+        let size = self
+            .shown
+            .as_ref()
+            .filter(|s| s.id == entry.id && !s.tiles.is_empty())
+            .map(|s| s.size);
+        // after keyboard(), so an Escape that closes the picker popup doesn't also close the viewer
+        let panel = self.info_open.then(|| {
+            Panel::right("viewer_info")
+                .default_size(info_panel::WIDTH)
+                .show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    info_panel::show(ui, &entry, size, info, places, &mut self.picker)
+                })
+                .inner
+        });
+        // a panel inside a ui moves its cursor but leaves max_rect as it was
+        let rect = ui.available_rect_before_wrap();
         let response = ui.allocate_rect(rect, Sense::click_and_drag());
         ui.painter().rect_filled(rect, 0.0, Color32::BLACK);
 
@@ -176,30 +229,45 @@ impl Viewer {
             .as_ref()
             .and_then(|p| p.get(entry.id))
             .and_then(|d| d.as_ref().err().cloned());
-        let size = self
-            .shown
-            .as_ref()
-            .filter(|s| s.id == entry.id && !s.tiles.is_empty())
-            .map(|s| s.size);
+        let mut placement = None;
         if let Some(size) = size {
             self.navigate(ui, &response, rect, size);
-            let placement = self.placement(rect, size, ui.ctx().pixels_per_point());
-            self.paint(ui, rect, placement);
-        } else if entry.kind == Kind::Video {
-            centred(ui, rect, "video");
+            let placed = self.placement(rect, size, ui.ctx().pixels_per_point());
+            self.paint(ui, rect, placed);
+            placement = Some(placed);
         } else if let Some(error) = &error {
             centred(ui, rect, error);
         } else if let Some(texture) = grid.thumbnail(ui.ctx(), &entry) {
             paint_thumbnail(ui, rect, &texture, &entry);
+        } else if entry.kind == Kind::Video {
+            centred(ui, rect, "video");
+        }
+
+        let hovered = panel.as_ref().and_then(|p| p.hovered);
+        if let Some(face) = hover_rect(placement, hovered) {
+            ui.painter_at(rect).rect_stroke(
+                face,
+                0.0,
+                Stroke::new(2.0, Color32::from_rgb(255, 210, 0)),
+                StrokeKind::Outside,
+            );
         }
 
         self.overlay(ui, rect, nav, index, &entry, size);
-        None
+        Self::location_bar(ui, rect, &entry, places);
+        let panel = panel.unwrap_or_default();
+        if !panel.picking {
+            self.picker.reset();
+        }
+        panel.action
     }
 
-    /// Returns whether to close.
+    /// Returns whether to close; inert while a text field or popup takes the keys.
     fn keyboard(&mut self, ui: &egui::Ui, nav: &mut NavSet) -> bool {
-        let (delta, close, fit, actual, external) = ui.input(|i| {
+        if ui.ctx().egui_wants_keyboard_input() || Popup::is_any_open(ui.ctx()) {
+            return false;
+        }
+        let (delta, close, fit, actual, external, info, play) = ui.input(|i| {
             let delta = [
                 (Key::ArrowLeft, -1),
                 (Key::PageUp, -1),
@@ -218,8 +286,23 @@ impl Viewer {
                 i.key_pressed(Key::Num0),
                 i.key_pressed(Key::Num1),
                 i.key_pressed(Key::O),
+                i.key_pressed(Key::I),
+                i.events.iter().any(|e| {
+                    matches!(
+                        e,
+                        egui::Event::Key {
+                            key: Key::Enter,
+                            pressed: true,
+                            repeat: false,
+                            ..
+                        }
+                    )
+                }),
             )
         });
+        if info {
+            self.info_open = !self.info_open;
+        }
         if delta != 0 {
             nav.step(delta);
         }
@@ -235,18 +318,20 @@ impl Viewer {
         if external {
             self.open_external(nav);
         }
+        if play && let Some(entry) = nav.current().filter(|e| e.kind == Kind::Video) {
+            self.message = Self::launch(&self.player, vec![entry.path.clone()]);
+        }
         close
     }
 
+    /// Wheel zoom applies only while the pointer is over the image, so the panel scrolls without zooming.
     fn navigate(&mut self, ui: &egui::Ui, response: &egui::Response, rect: Rect, size: Vec2) {
-        let (scroll, zoom, pointer) = ui.input(|i| {
-            (
-                i.smooth_scroll_delta.y,
-                i.zoom_delta(),
-                i.pointer.hover_pos(),
-            )
-        });
-        let factor = zoom * (scroll / 200.0).exp();
+        let (factor, pointer) = ui.input(|i| (zoom_factor(i), i.pointer.hover_pos()));
+        let factor = if response.contains_pointer() {
+            factor
+        } else {
+            1.0
+        };
         let drag = response.drag_delta();
         if factor == 1.0 && drag == Vec2::ZERO {
             return;
@@ -370,7 +455,7 @@ impl Viewer {
         }
     }
 
-    fn close(&mut self, gl: Option<&glow::Context>) {
+    pub(super) fn close(&mut self, gl: Option<&glow::Context>) {
         self.open = false;
         self.wanted = None;
         if let Some(gl) = gl {
@@ -390,7 +475,7 @@ impl Viewer {
         entry: &Entry,
         size: Option<Vec2>,
     ) {
-        let bar = Rect::from_min_size(rect.min, vec2(rect.width(), 28.0));
+        let bar = Rect::from_min_size(rect.min, vec2(rect.width(), BAR));
         ui.painter()
             .rect_filled(bar, 0.0, Color32::from_black_alpha(160));
         let mut parts = vec![file_name(entry), format!("{} / {}", index + 1, nav.len())];
@@ -409,7 +494,7 @@ impl Viewer {
             parts.push(message.clone());
         }
         let line = parts.join("   ");
-        let (mut external, mut show) = (false, false);
+        let (mut external, mut show, mut play) = (false, false, false);
         ui.scope_builder(
             UiBuilder::new()
                 .max_rect(bar.shrink2(vec2(8.0, 2.0)))
@@ -418,8 +503,12 @@ impl Viewer {
                 ui.visuals_mut().override_text_color = Some(Color32::from_gray(220));
                 ui.label(line);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.toggle_value(&mut self.info_open, "Info");
                     external = ui.button("Open in external viewer").clicked();
                     show = ui.button("Show in file manager").clicked();
+                    if entry.kind == Kind::Video {
+                        play = ui.button("Play").clicked();
+                    }
                 });
             },
         );
@@ -429,12 +518,44 @@ impl Viewer {
         if show {
             self.show_in_file_manager(ui.ctx(), entry);
         }
+        if play {
+            self.message = Self::launch(&self.player, vec![entry.path.clone()]);
+        }
+    }
+
+    /// Images only; videos get no bar.
+    fn location_bar(ui: &mut egui::Ui, rect: Rect, entry: &Entry, places: &Places<'_>) {
+        let Some(sha256) = entry.sha256.filter(|_| entry.kind == Kind::Image) else {
+            return;
+        };
+        let Some((_, location)) = places.location.filter(|(sha, _)| *sha == sha256) else {
+            // the cursor moved this frame; the caller loads its location next frame
+            ui.ctx().request_repaint();
+            return;
+        };
+        let bar = Rect::from_min_max(pos2(rect.min.x, rect.max.y - BAR), rect.max);
+        ui.painter()
+            .rect_filled(bar, 0.0, Color32::from_black_alpha(160));
+        ui.scope_builder(
+            UiBuilder::new()
+                .max_rect(bar.shrink2(vec2(8.0, 2.0)))
+                .layout(Layout::left_to_right(Align::Center)),
+            |ui| {
+                ui.visuals_mut().override_text_color = Some(Color32::from_gray(220));
+                ui.label(location_text(location.as_ref()));
+            },
+        );
     }
 
     fn open_external(&mut self, nav: &NavSet) {
-        self.message = spawn_external(&self.external, external_paths(nav))
+        self.message = Self::launch(&self.external, external_paths(nav));
+    }
+
+    /// Runs `argv` with `paths` appended; the error message, if any, for the message line.
+    fn launch(argv: &[String], paths: Vec<PathBuf>) -> Option<String> {
+        spawn_external(argv, paths)
             .err()
-            .map(|e| format!("cannot run {}: {e}", self.external.join(" ")));
+            .map(|e| format!("cannot run {}: {e}", argv.join(" ")))
     }
 
     /// On a thread, since a file manager may take a moment to answer.
@@ -539,6 +660,11 @@ fn file_uri(path: &Path) -> String {
     uri
 }
 
+/// The frame's pinch zoom combined with vertical scrolling.
+pub(super) fn zoom_factor(input: &egui::InputState) -> f32 {
+    input.zoom_delta() * (input.smooth_scroll_delta.y / 200.0).exp()
+}
+
 /// Keeps the image point under `pointer` fixed; `pan` and `pointer` are relative to the view centre, in points.
 fn zoom_at(scale: f32, pan: Vec2, factor: f32, pointer: Vec2) -> (f32, Vec2) {
     let zoomed = (scale * factor).clamp(MIN_SCALE, MAX_SCALE);
@@ -556,23 +682,46 @@ fn fit_scale(rect: Rect, size: Vec2, ppp: f32) -> f32 {
         .min(1.0 / ppp)
 }
 
+/// Where `face`, in image pixels, lands on screen for an image placed at `origin` with `scale` points per pixel.
+fn face_screen_rect(origin: Pos2, scale: f32, face: faces::Rect) -> Rect {
+    Rect::from_min_size(
+        origin + vec2(face.x, face.y) * scale,
+        vec2(face.w, face.h) * scale,
+    )
+}
+
+/// `None` unless the full image is shown, since face rects don't match the thumbnail's placement.
+fn hover_rect(placement: Option<(f32, Pos2)>, face: Option<faces::Rect>) -> Option<Rect> {
+    let (scale, origin) = placement?;
+    Some(face_screen_rect(origin, scale, face?))
+}
+
 /// The thumbnail fitted like the full image would be, so the switch to it doesn't jump.
 fn paint_thumbnail(ui: &egui::Ui, rect: Rect, texture: &TextureHandle, entry: &Entry) {
-    let thumb = texture.size_vec2();
-    let ppp = ui.ctx().pixels_per_point();
-    // catalog dimensions may predate orientation; take the aspect from the thumbnail
-    let longest = entry
-        .width
-        .max(entry.height)
-        .map_or(f32::INFINITY, |l| l as f32);
-    let full = thumb * (longest / thumb.x.max(thumb.y));
-    let size = full * fit_scale(rect, full, ppp);
+    let size = thumbnail_size(
+        rect,
+        texture.size_vec2(),
+        entry,
+        ui.ctx().pixels_per_point(),
+    );
     ui.painter().image(
         texture.id(),
         Rect::from_center_size(rect.center(), size),
         Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
         Color32::WHITE,
     );
+}
+
+/// Without catalog dimensions the thumbnail stands in for the full image.
+fn thumbnail_size(rect: Rect, thumb: Vec2, entry: &Entry, ppp: f32) -> Vec2 {
+    let thumb_longest = thumb.x.max(thumb.y);
+    // catalog dimensions may predate orientation; take the aspect from the thumbnail
+    let longest = entry
+        .width
+        .max(entry.height)
+        .map_or(thumb_longest, |l| l as f32);
+    let full = thumb * (longest / thumb_longest);
+    full * fit_scale(rect, full, ppp)
 }
 
 fn centred(ui: &egui::Ui, rect: Rect, text: &str) {
@@ -583,6 +732,18 @@ fn centred(ui: &egui::Ui, rect: Rect, text: &str) {
         FontId::proportional(16.0),
         Color32::from_gray(180),
     );
+}
+
+fn location_text(location: Option<&Location>) -> String {
+    let Some(location) = location else {
+        return "No location".to_owned();
+    };
+    let source = location.source.as_str();
+    let place = location
+        .place
+        .as_ref()
+        .map_or_else(|| "No location".to_owned(), Place::label);
+    format!("{place} ({source})")
 }
 
 fn file_name(entry: &Entry) -> String {
@@ -607,6 +768,7 @@ mod tests {
                     kind,
                     width: None,
                     height: None,
+                    duration_ms: None,
                 })
                 .collect(),
         )
@@ -674,6 +836,53 @@ mod tests {
             assert!((before - after).length() < 1e-3, "{before:?} {after:?}");
         }
         assert_eq!(zoom_at(MAX_SCALE, Vec2::ZERO, 2.0, pointer).0, MAX_SCALE);
+    }
+
+    const FACE: faces::Rect = faces::Rect {
+        x: 100.0,
+        y: 40.0,
+        w: 80.0,
+        h: 60.0,
+    };
+
+    #[test]
+    fn face_rect_follows_the_image_placement() {
+        assert_eq!(
+            face_screen_rect(pos2(10.0, 20.0), 0.5, FACE),
+            Rect::from_min_max(pos2(60.0, 40.0), pos2(100.0, 70.0))
+        );
+        assert_eq!(
+            face_screen_rect(pos2(-300.0, 0.0), 2.0, FACE),
+            Rect::from_min_max(pos2(-100.0, 80.0), pos2(60.0, 200.0))
+        );
+    }
+
+    #[test]
+    fn hover_rect_needs_the_full_image_and_a_face() {
+        let placement = Some((0.5, pos2(10.0, 20.0)));
+        assert_eq!(
+            hover_rect(placement, Some(FACE)),
+            Some(face_screen_rect(pos2(10.0, 20.0), 0.5, FACE))
+        );
+        assert_eq!(hover_rect(None, Some(FACE)), None);
+        assert_eq!(hover_rect(placement, None), None);
+    }
+
+    #[test]
+    fn thumbnail_size_without_dimensions_uses_the_thumbnail() {
+        let rect = Rect::from_min_size(Pos2::ZERO, vec2(1000.0, 500.0));
+        let mut entry = nav(&[Kind::Video]).entries()[0].clone();
+        assert_eq!(
+            thumbnail_size(rect, vec2(512.0, 288.0), &entry, 1.0),
+            vec2(512.0, 288.0)
+        );
+        assert_eq!(
+            thumbnail_size(rect, vec2(512.0, 288.0), &entry, 2.0),
+            vec2(256.0, 144.0)
+        );
+        (entry.width, entry.height) = (Some(1920), Some(1080));
+        let size = thumbnail_size(rect, vec2(512.0, 288.0), &entry, 1.0);
+        assert!((size - vec2(1920.0, 1080.0) * (500.0 / 1080.0)).length() < 1e-3);
     }
 
     #[test]

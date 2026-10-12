@@ -331,6 +331,7 @@ mod tests {
             kind: Kind::Image,
             width: size.map(|s| s.0),
             height: size.map(|s| s.1),
+            duration_ms: None,
         }
     }
 

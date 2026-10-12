@@ -3,6 +3,8 @@ Copyright (C) 2026 Franz Geffke <mail@gofranz.com>
 
 vitrine is licensed under the GNU General Public License, version 3 only (see LICENSE).
 
+The basemap in assets/basemap.vmap is made with Natural Earth (https://www.naturalearthdata.com), which is in the public domain.
+
 It contains code adapted from oculante (https://github.com/woelper/oculante), licensed under the MIT license below:
 
 - src/decode/loader.rs, from oculante src/image_loader.rs

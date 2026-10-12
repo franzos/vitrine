@@ -1,6 +1,11 @@
 use std::fs::{self, File, TryLockError};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::Duration;
+
+const RETRIES: u32 = 20;
+const RETRY_WAIT: Duration = Duration::from_millis(5);
 
 #[derive(Debug, thiserror::Error)]
 pub enum LockError {
@@ -17,7 +22,7 @@ pub struct IndexLock {
 }
 
 impl IndexLock {
-    /// Non-blocking; [`LockError::Held`] when any handle holds it, in this process or another.
+    /// [`LockError::Held`] when any handle holds it, in this process or another, for about 100 ms.
     pub fn acquire(path: &Path) -> Result<Self, LockError> {
         let io_err = |source| LockError::Io {
             path: path.to_owned(),
@@ -34,13 +39,17 @@ impl IndexLock {
             .write(true)
             .open(path)
             .map_err(io_err)?;
-        match file.try_lock() {
-            Ok(()) => Ok(Self { _file: file }),
-            Err(TryLockError::WouldBlock) => Err(LockError::Held {
-                path: path.to_owned(),
-            }),
-            Err(TryLockError::Error(e)) => Err(io_err(e)),
+        // a child forked by another thread shares the locked file until it execs
+        for _ in 0..RETRIES {
+            match file.try_lock() {
+                Ok(()) => return Ok(Self { _file: file }),
+                Err(TryLockError::WouldBlock) => thread::sleep(RETRY_WAIT),
+                Err(TryLockError::Error(e)) => return Err(io_err(e)),
+            }
         }
+        Err(LockError::Held {
+            path: path.to_owned(),
+        })
     }
 }
 

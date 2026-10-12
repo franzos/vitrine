@@ -2,15 +2,16 @@
 //! Rows whose file is gone are marked missing, never deleted; a new path with the same content takes over the row.
 
 mod faces;
+mod geo;
 mod meta;
 mod walk;
 mod writer;
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, PoisonError, mpsc};
+use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::thread;
 
 use rayon::prelude::*;
@@ -25,8 +26,11 @@ use crate::faces::detect::Scrfd;
 use crate::faces::embed::ArcFace;
 use crate::faces::fetch::{DETECTOR_NAME, EMBEDDING_DIM, MODEL_NAME};
 use crate::faces::runtime::{self, FaceRuntime};
+use crate::geo::GeoDb;
 use crate::lock::{IndexLock, LockError};
+use crate::slots::Slots;
 use crate::thumbs::{self, generate::BUCKETS};
+use crate::video::{self, Tools};
 use faces::{Models, Setup, Stage};
 use meta::Meta;
 use walk::{Found, Walk};
@@ -83,6 +87,16 @@ pub enum IndexEvent {
         path: PathBuf,
         faces: usize,
     },
+    /// Each of `images` ends in exactly one `GeoScanned` unless the stage stops early.
+    GeoPending {
+        images: usize,
+    },
+    /// `found` is `false` for content without usable GPS and for content left pending.
+    GeoScanned {
+        sha256: Sha256,
+        path: PathBuf,
+        found: bool,
+    },
     /// A file that reached hashing still gets a row with what could be read.
     Failed {
         path: PathBuf,
@@ -106,6 +120,7 @@ struct Job {
     path: PathBuf,
     size: u64,
     mtime_ns: i64,
+    kind: Kind,
     existing: Option<ImageId>,
 }
 
@@ -151,13 +166,15 @@ pub fn run(
             config: faces,
         })
     };
-    run_with(paths, roots, stage, cancel, on_event)
+    run_with(paths, roots, stage, &Tools::SYSTEM, cancel, on_event)
 }
 
+/// Without working `tools`, videos are stored unhashed and the run reports one failure.
 fn run_with(
     paths: &Paths,
     roots: &[PathBuf],
     stage: Stage<'_>,
+    tools: &Tools,
     cancel: &AtomicBool,
     mut on_event: impl FnMut(&IndexEvent),
 ) -> Result<Summary, Error> {
@@ -196,6 +213,23 @@ fn run_with(
         return Err(Error::Cancelled);
     }
 
+    let first_video = walked
+        .files
+        .iter()
+        .find(|(_, found)| found.kind == Kind::Video)
+        .map(|(path, _)| path.clone());
+    let have_tools = match first_video.map(|path| (path, tools.check())) {
+        Some((path, Err(e))) => {
+            walked.failures.push(Failure {
+                path,
+                error: format!("video: {e}; videos are not thumbnailed"),
+            });
+            false
+        }
+        Some((_, Ok(()))) => true,
+        None => false,
+    };
+
     let files = walked.files.len();
     let mut jobs = Vec::new();
     let mut direct = Vec::new();
@@ -204,7 +238,7 @@ fn run_with(
         if let Some(row) = &row
             && row.size == found.size
             && row.mtime_ns == found.mtime_ns
-            && (row.sha256.is_some() || row.kind == Kind::Video)
+            && (row.sha256.is_some() || (row.kind == Kind::Video && !have_tools))
         {
             if row.status == Status::Missing {
                 direct.push(Op::Restore { id: row.id, path });
@@ -212,14 +246,16 @@ fn run_with(
             continue;
         }
         let existing = row.map(|r| r.id);
-        match found.kind {
-            Kind::Image => jobs.push(Job {
+        if found.kind == Kind::Video && !have_tools {
+            direct.push(Op::Store(video(path, &found, existing)));
+        } else {
+            jobs.push(Job {
                 path,
                 size: found.size,
                 mtime_ns: found.mtime_ns,
+                kind: found.kind,
                 existing,
-            }),
-            Kind::Video => direct.push(Op::Store(video(path, &found, existing))),
+            });
         }
     }
     let pending = jobs.len()
@@ -279,8 +315,8 @@ fn run_with(
                 if cancel.load(Ordering::Relaxed) {
                     return Err(());
                 }
-                tx.send(Op::Store(hash(job, donors, thumbnails)))
-                    .map_err(drop)
+                let stored = hash(job, donors, thumbnails, tools, cancel).ok_or(())?;
+                tx.send(Op::Store(stored)).map_err(drop)
             });
         });
         writer.drain(direct, &rx)
@@ -314,6 +350,9 @@ fn run_with(
                 }),
             }
         }
+    }
+    if !geo_stage(&mut writer, &paths.geo_db(), &scope, cancel)? {
+        return Err(Error::Cancelled);
     }
     let (stats, failures) = writer.finish()?;
     Ok(Summary { stats, failures })
@@ -352,6 +391,42 @@ fn face_stage<F: FnMut(&IndexEvent)>(
     Ok(complete)
 }
 
+/// `false` when cancelled. Without `geo_db` coordinates stay pending.
+fn geo_stage<F: FnMut(&IndexEvent)>(
+    writer: &mut Writer<'_, F>,
+    geo_db: &Path,
+    scope: &[PathBuf],
+    cancel: &AtomicBool,
+) -> Result<bool, Error> {
+    let pending = crate::catalog::geo::unscanned(writer.conn, scope)?;
+    if !pending.is_empty() {
+        (writer.on_event)(&IndexEvent::GeoPending {
+            images: pending.len(),
+        });
+        let (tx, rx) = mpsc::channel();
+        let complete = thread::scope(|s| {
+            s.spawn(move || geo::scan_all(pending, cancel, &tx));
+            writer.drain(Vec::new(), &rx)
+        })?;
+        if !complete {
+            return Ok(false);
+        }
+    }
+    match GeoDb::open(geo_db) {
+        Ok(Some(gazetteer)) => {
+            if writer.backfill_places(&gazetteer, geo_db)?.is_none() {
+                return Ok(false);
+            }
+            Ok(writer.resolve(&gazetteer, geo_db)?)
+        }
+        Ok(None) => Ok(true),
+        Err(e) => {
+            writer.fail(geo::failure(geo_db, e));
+            Ok(true)
+        }
+    }
+}
+
 fn video(path: PathBuf, found: &Found, existing: Option<ImageId>) -> Stored {
     Stored {
         path,
@@ -376,41 +451,6 @@ struct Thumbnails {
     decodes: Slots,
 }
 
-struct Slots {
-    free: Mutex<usize>,
-    freed: Condvar,
-}
-
-impl Slots {
-    fn new(count: usize) -> Self {
-        Self {
-            free: Mutex::new(count),
-            freed: Condvar::new(),
-        }
-    }
-
-    fn acquire(&self) -> Slot<'_> {
-        let mut free = self.free.lock().unwrap_or_else(PoisonError::into_inner);
-        while *free == 0 {
-            free = self
-                .freed
-                .wait(free)
-                .unwrap_or_else(PoisonError::into_inner);
-        }
-        *free -= 1;
-        Slot(self)
-    }
-}
-
-struct Slot<'a>(&'a Slots);
-
-impl Drop for Slot<'_> {
-    fn drop(&mut self) {
-        *self.0.free.lock().unwrap_or_else(PoisonError::into_inner) += 1;
-        self.0.freed.notify_one();
-    }
-}
-
 impl Thumbnails {
     /// Buckets to make for `sha256`; empty when all are stored or another worker claimed it.
     fn claim(&self, sha256: Sha256) -> Vec<u32> {
@@ -428,21 +468,27 @@ impl Thumbnails {
     }
 }
 
-/// Image rows whose file is gone, by content: `gone` rows, plus `missing` rows outside `scope` whose path doesn't exist.
-fn donors(gone: &[Image], missing: &[Image], scope: &[PathBuf]) -> HashMap<Sha256, Vec<Donor>> {
+/// Hashed rows whose file is gone, by content and kind: `gone` rows, plus `missing` rows outside `scope` whose path doesn't exist.
+fn donors(
+    gone: &[Image],
+    missing: &[Image],
+    scope: &[PathBuf],
+) -> HashMap<(Sha256, Kind), Vec<Donor>> {
     let elsewhere = missing.iter().filter(|row| {
         !scope.iter().any(|root| row.path.starts_with(root))
             && fs::symlink_metadata(&row.path).is_err()
     });
-    let mut donors: HashMap<Sha256, Vec<Donor>> = HashMap::new();
+    let mut donors: HashMap<(Sha256, Kind), Vec<Donor>> = HashMap::new();
     for row in gone.iter().chain(elsewhere) {
-        if let (Some(sha256), Kind::Image) = (row.sha256, row.kind) {
-            donors.entry(sha256).or_default().push(Donor {
+        if let Some(sha256) = row.sha256 {
+            donors.entry((sha256, row.kind)).or_default().push(Donor {
                 id: row.id,
                 path: row.path.clone(),
                 meta: Meta {
                     dimensions: row.width.zip(row.height),
                     taken_at: row.taken_at.clone(),
+                    duration_ms: row.duration_ms,
+                    codec: row.codec.clone(),
                 },
             });
         }
@@ -450,12 +496,19 @@ fn donors(gone: &[Image], missing: &[Image], scope: &[PathBuf]) -> HashMap<Sha25
     donors
 }
 
-fn hash(job: Job, donors: &HashMap<Sha256, Vec<Donor>>, thumbnails: &Thumbnails) -> Stored {
+/// `None` when cancelled mid-file. Videos go through `tools` and take no decode slot.
+fn hash(
+    job: Job,
+    donors: &HashMap<(Sha256, Kind), Vec<Donor>>,
+    thumbnails: &Thumbnails,
+    tools: &Tools,
+    cancel: &AtomicBool,
+) -> Option<Stored> {
     let mut stored = Stored {
         path: job.path,
         size: job.size,
         mtime_ns: job.mtime_ns,
-        kind: Kind::Image,
+        kind: job.kind,
         existing: job.existing,
         sha256: None,
         meta: Meta::default(),
@@ -463,50 +516,73 @@ fn hash(job: Job, donors: &HashMap<Sha256, Vec<Donor>>, thumbnails: &Thumbnails)
         error: None,
         thumbs: Vec::new(),
     };
-    let sha256 = match meta::sha256(&stored.path) {
-        Ok(sha256) => sha256,
+    let sha256 = match meta::sha256(&stored.path, cancel) {
+        Ok(Some(sha256)) => sha256,
+        Ok(None) => return None,
         Err(e) => {
             stored.error = Some(e.to_string());
-            return stored;
+            return Some(stored);
         }
     };
     stored.sha256 = Some(sha256);
-    if let Some(found) = donors.get(&sha256) {
+    if let Some(found) = donors.get(&(sha256, stored.kind)) {
         stored.meta = found[0].meta.clone();
         stored.donors = found.iter().map(|d| (d.id, d.path.clone())).collect();
+    } else if stored.kind == Kind::Video {
+        match tools.probe(&stored.path, cancel) {
+            Ok(probed) => stored.meta = probed.into(),
+            Err(video::Error::Cancelled) => return None,
+            Err(e) => stored.error = Some(format!("video: {e}")),
+        }
     } else {
         let (meta, error) = meta::read(&stored.path);
         stored.meta = meta;
         stored.error = error.map(|e| format!("{e:#}"));
     }
-    // an unreadable header is already a failure and won't decode either
+    // an unreadable header or failed probe is already a failure and won't decode either
     if stored.error.is_none() {
         let buckets = thumbnails.claim(sha256);
         if !buckets.is_empty() {
-            let decode = |path: &std::path::Path| {
-                let _slot = thumbnails.decodes.acquire();
-                crate::decode::decode(path)
+            let made = if stored.kind == Kind::Video {
+                let duration_ms = stored.meta.duration_ms;
+                let largest = buckets.iter().copied().max().unwrap_or_default();
+                let frame = |path: &Path| Ok(tools.frame(path, duration_ms, largest, cancel)?);
+                thumbs::generate::generate_with(&stored.path, &buckets, frame)
+            } else {
+                let decode = |path: &Path| {
+                    let _slot = thumbnails.decodes.acquire();
+                    crate::decode::decode(path)
+                };
+                thumbs::generate::generate_with(&stored.path, &buckets, decode)
             };
-            match thumbs::generate::generate_with(&stored.path, &buckets, decode) {
+            match made {
                 Ok(made) => stored.thumbs = made.into_iter().map(|g| (g.bucket, g.thumb)).collect(),
+                Err(e) if matches!(e.downcast_ref(), Some(video::Error::Cancelled)) => return None,
                 Err(e) => stored.error = Some(format!("thumbnail: {e:#}")),
             }
         }
     }
-    stored
+    Some(stored)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::AtomicUsize;
+    use std::time::{Duration, Instant};
 
     use image::RgbImage;
 
     use super::*;
+    use crate::catalog::geo::Source;
     use crate::catalog::{self, runs};
     use crate::faces::align::ARCFACE_DST;
     use crate::faces::{Detection, FaceDetector, FaceEmbedder};
+
+    const NO_TOOLS: Tools = Tools {
+        ffprobe: "/nonexistent/ffprobe",
+        ffmpeg: "/nonexistent/ffmpeg",
+    };
 
     fn off() -> config::Faces {
         config::Faces::default()
@@ -528,23 +604,6 @@ mod tests {
             cache_dir: root.join("cache"),
         };
         (dir, paths, tree)
-    }
-
-    #[test]
-    fn slots_block_until_one_is_freed() {
-        let slots = Slots::new(2);
-        let held = [slots.acquire(), slots.acquire()];
-        let taken = AtomicBool::new(false);
-        thread::scope(|s| {
-            s.spawn(|| {
-                let _slot = slots.acquire();
-                taken.store(true, Ordering::SeqCst);
-            });
-            thread::sleep(std::time::Duration::from_millis(50));
-            assert!(!taken.load(Ordering::SeqCst));
-            drop(held);
-        });
-        assert!(taken.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -587,6 +646,175 @@ mod tests {
 
         let summary = run(&paths, &roots, &off(), &AtomicBool::new(false), |_| {}).unwrap();
         assert_eq!((summary.stats.added, summary.stats.vanished), (1, 1));
+    }
+
+    fn with_clip(tree: &Path) -> PathBuf {
+        let clip = tree.join("clip.mp4");
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        fs::copy(fixtures.join("clip.mp4"), &clip).unwrap();
+        clip
+    }
+
+    fn run_tools(
+        paths: &Paths,
+        roots: &[PathBuf],
+        tools: &Tools,
+        cancel: &AtomicBool,
+    ) -> (Result<Summary, Error>, Vec<IndexEvent>) {
+        let mut events = Vec::new();
+        let result = run_with(paths, roots, Stage::Off, tools, cancel, |e| {
+            events.push(e.clone());
+        });
+        (result, events)
+    }
+
+    #[test]
+    fn missing_tools_leave_videos_unhashed_and_fail_each_run() {
+        let (_dir, paths, tree) = setup();
+        let clip = with_clip(&tree);
+        let roots = [tree];
+        let never = AtomicBool::new(false);
+        let expected = [Failure {
+            path: clip.clone(),
+            error: "video: /nonexistent/ffprobe not found; videos are not thumbnailed".to_owned(),
+        }];
+
+        let (summary, _) = run_tools(&paths, &roots, &NO_TOOLS, &never);
+        let summary = summary.unwrap();
+        assert_eq!(summary.failures, expected);
+        let stats = summary.stats;
+        assert_eq!((stats.added, stats.hashed, stats.failed), (3, 2, 1));
+        let conn = catalog::open(&paths.catalog_db()).unwrap();
+        let row = images::get_by_path(&conn, &clip).unwrap().unwrap();
+        assert_eq!((row.kind, row.sha256), (Kind::Video, None));
+        assert_eq!(images::counts(&conn).unwrap().unhashed, 1);
+
+        let (summary, events) = run_tools(&paths, &roots, &NO_TOOLS, &never);
+        let summary = summary.unwrap();
+        assert_eq!(summary.failures, expected);
+        assert_eq!((summary.stats.added, summary.stats.changed), (0, 0));
+        assert!(events.contains(&IndexEvent::Walked {
+            files: 3,
+            pending: 0
+        }));
+    }
+
+    #[test]
+    fn cancel_stops_a_running_tool_call() {
+        let (dir, paths, tree) = setup();
+        with_clip(&tree);
+        let started = dir.path().join("started");
+        let script = dir.path().join("tool");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n[ \"$1\" = -version ] && exit 0\ntouch '{}'\nexec sleep 30\n",
+                started.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let program: &'static str = Box::leak(script.to_str().unwrap().to_owned().into_boxed_str());
+        let tools = Tools {
+            ffprobe: program,
+            ffmpeg: program,
+        };
+
+        let cancel = AtomicBool::new(false);
+        let start = Instant::now();
+        let result = thread::scope(|s| {
+            s.spawn(|| {
+                while !started.exists() && start.elapsed() < Duration::from_secs(20) {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                cancel.store(true, Ordering::Relaxed);
+            });
+            run_tools(&paths, std::slice::from_ref(&tree), &tools, &cancel).0
+        });
+        assert!(started.exists());
+        assert!(matches!(result, Err(Error::Cancelled)), "{result:?}");
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn videos_are_hashed_probed_and_thumbnailed() {
+        if !video::tools_present() {
+            return;
+        }
+        let (_dir, paths, tree) = setup();
+        let clip = with_clip(&tree);
+        let roots = [tree.clone()];
+        let never = AtomicBool::new(false);
+
+        let (summary, events) = run_tools(&paths, &roots, &Tools::SYSTEM, &never);
+        let summary = summary.unwrap();
+        assert_eq!(summary.failures, []);
+        let stats = summary.stats;
+        assert_eq!((stats.added, stats.hashed, stats.thumbnailed), (3, 3, 3));
+        // videos stay out of the geo and face stages
+        assert!(events.contains(&IndexEvent::GeoPending { images: 2 }));
+        let conn = catalog::open(&paths.catalog_db()).unwrap();
+        let model =
+            crate::catalog::faces::register_model(&conn, "fake", "fake-detector", 4).unwrap();
+        assert_eq!(
+            crate::catalog::faces::pending(&conn, model, &roots)
+                .unwrap()
+                .len(),
+            2
+        );
+
+        let row = images::get_by_path(&conn, &clip).unwrap().unwrap();
+        let sha256 = row.sha256.unwrap();
+        assert_eq!(row.kind, Kind::Video);
+        assert_eq!((row.width, row.height), (Some(72), Some(56)));
+        assert_eq!(row.duration_ms, Some(1000));
+        assert_eq!(row.codec.as_deref(), Some("h264"));
+        assert!(
+            row.taken_at.as_deref().unwrap().starts_with("2024-05-0"),
+            "{row:?}"
+        );
+        let stored = thumbs::keys(&thumbs::open(&paths.thumbs_db()).unwrap()).unwrap();
+        assert!(BUCKETS.iter().all(|&b| stored.contains(&(sha256, b))));
+        assert_eq!(images::counts(&conn).unwrap().unhashed, 0);
+
+        let (summary, _) = run_tools(&paths, &roots, &Tools::SYSTEM, &never);
+        assert_eq!(summary.unwrap().stats.hashed, 0);
+
+        let moved = tree.join("moved.mp4");
+        fs::rename(&clip, &moved).unwrap();
+        let (summary, _) = run_tools(&paths, &roots, &Tools::SYSTEM, &never);
+        let stats = summary.unwrap().stats;
+        assert_eq!(
+            (stats.moved, stats.added, stats.vanished, stats.thumbnailed),
+            (1, 0, 0, 0)
+        );
+        let after = images::get_by_path(&conn, &moved).unwrap().unwrap();
+        assert_eq!((after.id, after.duration_ms), (row.id, row.duration_ms));
+        assert_eq!(images::get_by_path(&conn, &clip).unwrap(), None);
+    }
+
+    #[test]
+    fn tools_appearing_upgrade_placeholders() {
+        if !video::tools_present() {
+            return;
+        }
+        let (_dir, paths, tree) = setup();
+        let clip = with_clip(&tree);
+        let roots = [tree];
+        let never = AtomicBool::new(false);
+        run_tools(&paths, &roots, &NO_TOOLS, &never).0.unwrap();
+
+        let (summary, _) = run_tools(&paths, &roots, &Tools::SYSTEM, &never);
+        let summary = summary.unwrap();
+        assert_eq!(summary.failures, []);
+        assert_eq!((summary.stats.changed, summary.stats.hashed), (1, 1));
+        let conn = catalog::open(&paths.catalog_db()).unwrap();
+        let row = images::get_by_path(&conn, &clip).unwrap().unwrap();
+        assert!(row.sha256.is_some() && row.duration_ms.is_some());
     }
 
     /// Every image yields one counted face and one too small to count.
@@ -665,9 +893,16 @@ mod tests {
             config: &config::Faces::default(),
         });
         let mut events = Vec::new();
-        let summary = run_with(paths, roots, stage, &AtomicBool::new(false), |e| {
-            events.push(e.clone());
-        })
+        let summary = run_with(
+            paths,
+            roots,
+            stage,
+            &NO_TOOLS,
+            &AtomicBool::new(false),
+            |e| {
+                events.push(e.clone());
+            },
+        )
         .unwrap();
         (summary, events)
     }
@@ -925,7 +1160,15 @@ mod tests {
             load: &load,
             config: &config::Faces::default(),
         });
-        let summary = run_with(&paths, &roots, stage, &AtomicBool::new(false), |_| {}).unwrap();
+        let summary = run_with(
+            &paths,
+            &roots,
+            stage,
+            &NO_TOOLS,
+            &AtomicBool::new(false),
+            |_| {},
+        )
+        .unwrap();
         assert_eq!(
             summary.failures,
             [Failure {
@@ -935,5 +1178,397 @@ mod tests {
         );
         let summary = run_fake(&paths, &roots, &Fake::default());
         assert_eq!(summary.stats.faces_scanned, 2);
+    }
+
+    fn with_gps(tree: &Path) {
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        fs::copy(fixtures.join("gps.jpg"), tree.join("gps.jpg")).unwrap();
+    }
+
+    fn run_events(paths: &Paths, roots: &[PathBuf]) -> (Summary, Vec<IndexEvent>) {
+        let mut events = Vec::new();
+        let summary = run(paths, roots, &off(), &AtomicBool::new(false), |e| {
+            events.push(e.clone());
+        })
+        .unwrap();
+        (summary, events)
+    }
+
+    fn geo_scans(paths: &Paths) -> Vec<(PathBuf, Option<(f64, f64)>)> {
+        let conn = catalog::open(&paths.catalog_db()).unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT min(i.path), s.lat, s.lon FROM geo_scans s
+                 JOIN images i ON i.sha256 = s.sha256
+                 GROUP BY s.sha256 ORDER BY 1",
+            )
+            .unwrap();
+        stmt.query_map([], |r| {
+            let lat: Option<f64> = r.get(1)?;
+            let lon: Option<f64> = r.get(2)?;
+            Ok((PathBuf::from(r.get::<_, String>(0)?), lat.zip(lon)))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+    }
+
+    #[test]
+    fn geo_stage_stores_coordinates_without_a_gazetteer() {
+        let (_dir, paths, tree) = setup();
+        with_gps(&tree);
+        assert!(!paths.geo_db().exists());
+        let (summary, events) = run_events(&paths, std::slice::from_ref(&tree));
+        assert_eq!(summary.failures, []);
+        assert_eq!(
+            (
+                summary.stats.added,
+                summary.stats.gps_found,
+                summary.stats.places_resolved
+            ),
+            (3, 1, 0)
+        );
+
+        let pending = events
+            .iter()
+            .position(|e| *e == IndexEvent::GeoPending { images: 3 })
+            .unwrap();
+        let scanned: Vec<usize> = events
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| matches!(e, IndexEvent::GeoScanned { .. }))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(scanned.len(), 3);
+        assert!(scanned.iter().all(|&i| i > pending));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            IndexEvent::GeoScanned { path, found: true, .. } if *path == tree.join("gps.jpg")
+        )));
+
+        let scans = geo_scans(&paths);
+        assert_eq!(scans.len(), 3);
+        let (lat, lon) = scans[0].1.unwrap();
+        assert_eq!(scans[0].0, tree.join("gps.jpg"));
+        assert!((lat - 38.7223).abs() < 1e-4 && (lon + 9.1393).abs() < 1e-4);
+        assert_eq!((scans[1].1, scans[2].1), (None, None));
+
+        let conn = catalog::open(&paths.catalog_db()).unwrap();
+        assert_eq!(runs::last(&conn).unwrap().unwrap().stats, summary.stats);
+        let located: i64 = conn
+            .query_row("SELECT count(*) FROM locations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(located, 0);
+    }
+
+    #[test]
+    fn geo_stage_backfills_unchanged_files_once() {
+        let (_dir, paths, tree) = setup();
+        with_gps(&tree);
+        let roots = [tree.clone()];
+        run(&paths, &roots, &off(), &AtomicBool::new(false), |_| {}).unwrap();
+        // a catalog indexed before the stage existed
+        catalog::open(&paths.catalog_db())
+            .unwrap()
+            .execute("DELETE FROM geo_scans", [])
+            .unwrap();
+
+        let (summary, events) = run_events(&paths, &roots);
+        assert_eq!((summary.stats.hashed, summary.stats.gps_found), (0, 1));
+        assert!(events.contains(&IndexEvent::GeoPending { images: 3 }));
+        assert_eq!(geo_scans(&paths).len(), 3);
+
+        let (summary, events) = run_events(&paths, &roots);
+        assert_eq!(summary.stats.gps_found, 0);
+        assert!(!events.iter().any(|e| matches!(
+            e,
+            IndexEvent::GeoPending { .. } | IndexEvent::GeoScanned { .. }
+        )));
+    }
+
+    #[test]
+    fn unopenable_file_stays_pending_for_gps() {
+        let (_dir, paths, tree) = setup();
+        let mut conn = catalog::open(&paths.catalog_db()).unwrap();
+        let gone = tree.join("gone.jpg");
+        images::upsert(
+            &conn,
+            &images::NewImage {
+                path: &gone,
+                size: 1,
+                mtime_ns: 1,
+                sha256: Some([7; 32]),
+                kind: Kind::Image,
+                width: None,
+                height: None,
+                taken_at: None,
+                duration_ms: None,
+                codec: None,
+            },
+        )
+        .unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut events = Vec::new();
+        let mut writer = Writer::new(
+            &mut conn,
+            |e: &IndexEvent| events.push(e.clone()),
+            RunStats::default(),
+            &cancel,
+        );
+        assert!(
+            geo_stage(
+                &mut writer,
+                &paths.geo_db(),
+                std::slice::from_ref(&tree),
+                &cancel
+            )
+            .unwrap()
+        );
+        let failures = std::mem::take(&mut writer.failures);
+        drop(writer);
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].path, gone);
+        assert!(failures[0].error.starts_with("gps: "), "{failures:?}");
+        assert!(events.contains(&IndexEvent::GeoScanned {
+            sha256: [7; 32],
+            path: gone.clone(),
+            found: false,
+        }));
+        assert_eq!(
+            crate::catalog::geo::unscanned(&conn, &[tree]).unwrap(),
+            [([7; 32], gone)]
+        );
+    }
+
+    #[test]
+    fn cancelled_geo_stage_is_not_recorded() {
+        let (_dir, paths, tree) = setup();
+        let roots = [tree];
+        let cancel = AtomicBool::new(false);
+        let err = run(&paths, &roots, &off(), &cancel, |event| {
+            if matches!(event, IndexEvent::GeoPending { .. }) {
+                cancel.store(true, Ordering::Relaxed);
+            }
+        })
+        .unwrap_err();
+        assert!(matches!(err, Error::Cancelled), "{err:?}");
+        let conn = catalog::open(&paths.catalog_db()).unwrap();
+        assert_eq!(runs::last(&conn).unwrap(), None);
+        assert_eq!(images::counts(&conn).unwrap().images, 2);
+    }
+
+    const LISBON: i64 = 2_267_057;
+
+    fn cities() -> String {
+        use crate::geo::fixtures::city;
+        [
+            city(
+                LISBON, "Lisbon", "Lisbon", "Lisboa", 38.71667, -9.13333, "PT", "14", 517_802,
+            ),
+            city(
+                2_735_943, "Porto", "Porto", "", 41.14961, -8.61099, "PT", "17", 249_633,
+            ),
+        ]
+        .concat()
+    }
+
+    fn gazetteer(paths: &Paths) {
+        fs::create_dir_all(&paths.data_dir).unwrap();
+        crate::geo::fixtures::build(&paths.data_dir, &cities());
+    }
+
+    fn located(paths: &Paths, path: &Path) -> Option<(Option<i64>, Source)> {
+        let conn = catalog::open(&paths.catalog_db()).unwrap();
+        let sha256: Sha256 = conn
+            .query_row(
+                "SELECT sha256 FROM images WHERE path = ?1",
+                [path.to_str().unwrap()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        crate::catalog::geo::location_of(&conn, &sha256)
+            .unwrap()
+            .map(|l| (l.place.map(|p| p.geoname_id), l.source))
+    }
+
+    #[test]
+    fn coordinates_resolve_once_a_gazetteer_appears() {
+        let (_dir, paths, tree) = setup();
+        with_gps(&tree);
+        fs::copy(tree.join("gps.jpg"), tree.join("gps-copy.jpg")).unwrap();
+        let roots = [tree.clone()];
+        let (summary, _) = run_events(&paths, &roots);
+        assert_eq!(
+            (summary.stats.gps_found, summary.stats.places_resolved),
+            (1, 0)
+        );
+        assert_eq!(located(&paths, &tree.join("gps.jpg")), None);
+
+        gazetteer(&paths);
+        let (summary, _) = run_events(&paths, &roots);
+        assert_eq!(summary.failures, []);
+        assert_eq!(
+            (summary.stats.gps_found, summary.stats.places_resolved),
+            (0, 1)
+        );
+        for name in ["gps.jpg", "gps-copy.jpg"] {
+            assert_eq!(
+                located(&paths, &tree.join(name)),
+                Some((Some(LISBON), Source::Exif))
+            );
+        }
+        let conn = catalog::open(&paths.catalog_db()).unwrap();
+        assert_eq!(runs::last(&conn).unwrap().unwrap().stats, summary.stats);
+
+        let (summary, _) = run_events(&paths, &roots);
+        assert_eq!(summary.stats.places_resolved, 0);
+    }
+
+    #[test]
+    fn index_run_backfills_place_coordinates_once() {
+        use crate::catalog::geo::{tests::place, upsert_place};
+
+        let (_dir, paths, tree) = setup();
+        let mut conn = catalog::open(&paths.catalog_db()).unwrap();
+        catalog::edit(&mut conn, |tx| {
+            upsert_place(tx, &place(LISBON, "Lisbon"))?;
+            upsert_place(tx, &place(9, "Elsewhere"))
+        });
+        drop(conn);
+        gazetteer(&paths);
+        let roots = [tree];
+        let coords = |paths: &Paths| -> Vec<(i64, Option<f64>, Option<f64>)> {
+            let conn = catalog::open(&paths.catalog_db()).unwrap();
+            let mut stmt = conn
+                .prepare("SELECT geoname_id, lat, lon FROM places ORDER BY geoname_id")
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        let expected = vec![(9, None, None), (LISBON, Some(38.71667), Some(-9.13333))];
+
+        let (summary, _) = run_events(&paths, &roots);
+        assert_eq!(summary.failures, []);
+        assert_eq!(coords(&paths), expected);
+
+        let (summary, _) = run_events(&paths, &roots);
+        assert_eq!(summary.failures, []);
+        assert_eq!(coords(&paths), expected);
+
+        let gazetteer = GeoDb::open(&paths.geo_db()).unwrap().unwrap();
+        let mut conn = catalog::open(&paths.catalog_db()).unwrap();
+        assert_eq!(
+            crate::catalog::geo::places_without_coords(&conn).unwrap(),
+            [9]
+        );
+        let cancel = AtomicBool::new(false);
+        let mut writer = Writer::new(&mut conn, |_: &IndexEvent| {}, RunStats::default(), &cancel);
+        assert_eq!(
+            writer.backfill_places(&gazetteer, &paths.geo_db()).unwrap(),
+            Some(0)
+        );
+        cancel.store(true, Ordering::Relaxed);
+        assert_eq!(
+            writer.backfill_places(&gazetteer, &paths.geo_db()).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn manual_locations_and_markers_win_over_exif() {
+        use crate::catalog::geo::{clear, insert_scan, set_manual, tests::place};
+
+        let (dir, mut conn) = catalog::temp();
+        let gazetteer = crate::geo::fixtures::build(dir.path(), &cities());
+        let (manual, marker, free, no_gps) = ([1; 32], [2; 32], [3; 32], [4; 32]);
+        catalog::edit(&mut conn, |tx| {
+            for sha in [manual, marker, free] {
+                insert_scan(tx, &sha, Some((38.7223, -9.1393)))?;
+            }
+            insert_scan(tx, &no_gps, None)?;
+            set_manual(tx, &manual, &place(9, "Elsewhere"), 10)?;
+            clear(tx, &marker, 10)
+        });
+        let cancel = AtomicBool::new(false);
+        let mut writer = Writer::new(&mut conn, |_: &IndexEvent| {}, RunStats::default(), &cancel);
+        assert!(writer.resolve(&gazetteer, dir.path()).unwrap());
+        assert_eq!(writer.stats.places_resolved, 1);
+        assert_eq!(writer.failures, []);
+        drop(writer);
+
+        let at = |sha| {
+            crate::catalog::geo::location_of(&conn, &sha)
+                .unwrap()
+                .map(|l| (l.place.map(|p| p.geoname_id), l.source))
+        };
+        assert_eq!(at(manual), Some((Some(9), Source::Manual)));
+        assert_eq!(at(marker), Some((None, Source::Manual)));
+        assert_eq!(at(free), Some((Some(LISBON), Source::Exif)));
+        assert_eq!(at(no_gps), None);
+    }
+
+    #[test]
+    fn resolve_pages_past_unplaceable_scans_and_stops_on_cancel() {
+        use crate::geo::fixtures::{ADMIN1, COUNTRIES};
+
+        let (dir, mut conn) = catalog::temp();
+        let shas: Vec<Sha256> = (0..=500_u16)
+            .map(|i| {
+                let mut sha = [0; 32];
+                sha[..2].copy_from_slice(&i.to_be_bytes());
+                sha
+            })
+            .collect();
+        catalog::edit(&mut conn, |tx| {
+            shas.iter().try_for_each(|sha| {
+                crate::catalog::geo::insert_scan(tx, sha, Some((38.7223, -9.1393)))
+            })
+        });
+        let empty = dir.path().join("empty.db");
+        crate::geo::build(
+            &empty,
+            vec![crate::geo::Rows::all("cities1000.txt", &b""[..])],
+            ADMIN1.as_bytes(),
+            COUNTRIES.as_bytes(),
+            0,
+        )
+        .unwrap();
+        let empty = GeoDb::open(&empty).unwrap().unwrap();
+        let full = crate::geo::fixtures::build(dir.path(), &cities());
+
+        let cancel = AtomicBool::new(true);
+        let mut writer = Writer::new(&mut conn, |_: &IndexEvent| {}, RunStats::default(), &cancel);
+        assert!(!writer.resolve(&full, dir.path()).unwrap());
+        cancel.store(false, Ordering::Relaxed);
+        assert!(writer.resolve(&empty, dir.path()).unwrap());
+        assert_eq!(writer.stats.places_resolved, 0);
+        assert!(writer.resolve(&full, dir.path()).unwrap());
+        assert_eq!(writer.stats.places_resolved, 501);
+        drop(writer);
+        assert!(
+            crate::catalog::geo::unresolved(&conn, None, 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn unusable_gazetteer_fails_and_keeps_coordinates() {
+        let (_dir, paths, tree) = setup();
+        with_gps(&tree);
+        fs::create_dir_all(&paths.data_dir).unwrap();
+        fs::write(paths.geo_db(), b"not a database").unwrap();
+        let (summary, _) = run_events(&paths, std::slice::from_ref(&tree));
+        assert_eq!(summary.stats.gps_found, 1);
+        assert_eq!(summary.failures.len(), 1);
+        assert_eq!(summary.failures[0].path, paths.geo_db());
+        assert!(
+            summary.failures[0].error.starts_with("geo: failed to open"),
+            "{:?}",
+            summary.failures
+        );
+        assert_eq!(located(&paths, &tree.join("gps.jpg")), None);
     }
 }

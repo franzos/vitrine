@@ -2,6 +2,7 @@ use std::fs::File;
 use std::io::{self, BufReader, Cursor, Read};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result, anyhow};
 use image::{GenericImageView, ImageReader};
@@ -10,6 +11,7 @@ use sha2::Digest;
 use super::walk::lowercase_extension;
 use crate::db::Sha256;
 use crate::decode::RAW_EXTENSIONS;
+use crate::video::VideoMeta;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Meta {
@@ -17,13 +19,30 @@ pub(crate) struct Meta {
     pub dimensions: Option<(u32, u32)>,
     /// EXIF `DateTimeOriginal` as `%Y-%m-%dT%H:%M:%S`.
     pub taken_at: Option<String>,
+    pub duration_ms: Option<u64>,
+    pub codec: Option<String>,
 }
 
-pub(crate) fn sha256(path: &Path) -> io::Result<Sha256> {
+impl From<VideoMeta> for Meta {
+    fn from(video: VideoMeta) -> Self {
+        Self {
+            dimensions: video.width.zip(video.height),
+            taken_at: video.taken_at,
+            duration_ms: video.duration_ms,
+            codec: video.codec,
+        }
+    }
+}
+
+/// `None` once `cancel` is set, checked between chunks.
+pub(crate) fn sha256(path: &Path, cancel: &AtomicBool) -> io::Result<Option<Sha256>> {
     let mut file = File::open(path)?;
     let mut hasher = sha2::Sha256::new();
     let mut buf = vec![0; 1 << 16];
     loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
         match file.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => hasher.update(&buf[..n]),
@@ -31,7 +50,7 @@ pub(crate) fn sha256(path: &Path) -> io::Result<Sha256> {
             Err(e) => return Err(e),
         }
     }
-    Ok(hasher.finalize().into())
+    Ok(Some(hasher.finalize().into()))
 }
 
 /// The error says why dimensions are unknown; capture time is kept with it, except after a panic.
@@ -60,6 +79,7 @@ fn read_unguarded(path: &Path) -> (Meta, Option<anyhow::Error>) {
             Meta {
                 dimensions: Some(dimensions),
                 taken_at,
+                ..Meta::default()
             },
             None,
         ),
@@ -67,6 +87,7 @@ fn read_unguarded(path: &Path) -> (Meta, Option<anyhow::Error>) {
             Meta {
                 dimensions: None,
                 taken_at,
+                ..Meta::default()
             },
             Some(e),
         ),
@@ -135,10 +156,89 @@ fn taken_at(exif: &exif::Exif) -> Option<String> {
     })
 }
 
+/// JPEGs with a hand-built little-endian EXIF block, spliced into the `jpeg.jpg` fixture.
+#[cfg(test)]
+pub(crate) mod exif_jpeg {
+    use std::path::Path;
+
+    pub(crate) const EXIF_IFD: u16 = 0x8769;
+    pub(crate) const GPS_IFD: u16 = 0x8825;
+
+    pub(crate) enum Value<'a> {
+        /// Including the trailing NUL.
+        Ascii(&'a [u8]),
+        Rational(&'a [(u32, u32)]),
+        Ifd(&'a [(u16, Value<'a>)]),
+    }
+
+    /// `ifd0` entries, and those of nested IFDs, in ascending tag order.
+    pub(crate) fn build(ifd0: &[(u16, Value<'_>)]) -> Vec<u8> {
+        let mut tiff = b"II\x2a\x00\x08\x00\x00\x00".to_vec();
+        write_ifd(&mut tiff, ifd0);
+        let jpeg =
+            std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/jpeg.jpg"))
+                .unwrap();
+        let length = u16::try_from(2 + 6 + tiff.len()).unwrap();
+        let mut out = jpeg[..2].to_vec();
+        out.extend([0xFF, 0xE1]);
+        out.extend(length.to_be_bytes());
+        out.extend(b"Exif\0\0");
+        out.extend(tiff);
+        out.extend(&jpeg[2..]);
+        out
+    }
+
+    fn write_ifd(tiff: &mut Vec<u8>, entries: &[(u16, Value<'_>)]) -> u32 {
+        align(tiff);
+        let start = tiff.len();
+        tiff.extend(u16::try_from(entries.len()).unwrap().to_le_bytes());
+        tiff.resize(start + 2 + 12 * entries.len() + 4, 0);
+        for (i, (tag, value)) in entries.iter().enumerate() {
+            let (kind, count, field) = match value {
+                Value::Ascii(s) => (2u16, s.len(), place(tiff, s)),
+                Value::Rational(r) => {
+                    let bytes: Vec<u8> = r
+                        .iter()
+                        .flat_map(|(n, d)| n.to_le_bytes().into_iter().chain(d.to_le_bytes()))
+                        .collect();
+                    (5, r.len(), place(tiff, &bytes))
+                }
+                Value::Ifd(sub) => (4, 1, write_ifd(tiff, sub).to_le_bytes()),
+            };
+            let at = start + 2 + 12 * i;
+            tiff[at..at + 2].copy_from_slice(&tag.to_le_bytes());
+            tiff[at + 2..at + 4].copy_from_slice(&kind.to_le_bytes());
+            tiff[at + 4..at + 8].copy_from_slice(&u32::try_from(count).unwrap().to_le_bytes());
+            tiff[at + 8..at + 12].copy_from_slice(&field);
+        }
+        u32::try_from(start).unwrap()
+    }
+
+    /// Up to four bytes go inline in the entry; longer values get an offset.
+    fn place(tiff: &mut Vec<u8>, bytes: &[u8]) -> [u8; 4] {
+        if bytes.len() <= 4 {
+            let mut field = [0; 4];
+            field[..bytes.len()].copy_from_slice(bytes);
+            return field;
+        }
+        align(tiff);
+        let offset = u32::try_from(tiff.len()).unwrap();
+        tiff.extend(bytes);
+        offset.to_le_bytes()
+    }
+
+    fn align(tiff: &mut Vec<u8>) {
+        if tiff.len() % 2 == 1 {
+            tiff.push(0);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
+    use super::exif_jpeg::{self, Value};
     use super::*;
 
     const FIXTURES: &[(&str, (u32, u32))] = &[
@@ -184,39 +284,24 @@ mod tests {
         }
     }
 
-    fn jpeg_taken_at(value: &[u8; 20]) -> Vec<u8> {
-        let mut tiff = b"II\x2a\x00\x08\x00\x00\x00".to_vec();
-        // IFD0 at 8 with the Exif IFD pointer, Exif IFD at 26, string at 44
-        tiff.extend(1u16.to_le_bytes());
-        tiff.extend([0x69, 0x87, 4, 0, 1, 0, 0, 0, 26, 0, 0, 0]);
-        tiff.extend(0u32.to_le_bytes());
-        tiff.extend(1u16.to_le_bytes());
-        tiff.extend([0x03, 0x90, 2, 0, 20, 0, 0, 0, 44, 0, 0, 0]);
-        tiff.extend(0u32.to_le_bytes());
-        tiff.extend(value);
-
-        let jpeg = std::fs::read(fixture("jpeg.jpg")).unwrap();
-        let length = u16::try_from(2 + 6 + tiff.len()).unwrap();
-        let mut out = jpeg[..2].to_vec();
-        out.extend([0xFF, 0xE1]);
-        out.extend(length.to_be_bytes());
-        out.extend(b"Exif\0\0");
-        out.extend(tiff);
-        out.extend(&jpeg[2..]);
-        out
+    fn taken(value: &[u8]) -> Vec<u8> {
+        exif_jpeg::build(&[(
+            exif_jpeg::EXIF_IFD,
+            Value::Ifd(&[(0x9003, Value::Ascii(value))]),
+        )])
     }
 
     #[test]
     fn reads_date_time_original() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("taken.jpg");
-        std::fs::write(&path, jpeg_taken_at(b"2024:05:01 10:11:12\0")).unwrap();
+        std::fs::write(&path, taken(b"2024:05:01 10:11:12\0")).unwrap();
         let (meta, error) = read(&path);
         assert!(error.is_none(), "{error:?}");
         assert_eq!(meta.taken_at.as_deref(), Some("2024-05-01T10:11:12"));
         assert_eq!(meta.dimensions, Some((64, 48)));
 
-        std::fs::write(&path, jpeg_taken_at(b"0000:00:00 00:00:00\0")).unwrap();
+        std::fs::write(&path, taken(b"0000:00:00 00:00:00\0")).unwrap();
         assert_eq!(read(&path).0.taken_at, None);
     }
 
@@ -236,9 +321,32 @@ mod tests {
         let path = dir.path().join("a");
         std::fs::write(&path, b"abc").unwrap();
         assert_eq!(
-            sha256(&path).unwrap()[..4],
+            sha256(&path, &AtomicBool::new(false)).unwrap().unwrap()[..4],
             [0xba, 0x78, 0x16, 0xbf],
             "sha256(\"abc\") starts with ba7816bf"
         );
+    }
+
+    #[test]
+    fn sha256_stops_once_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a");
+        std::fs::write(&path, vec![0; 1 << 17]).unwrap();
+        assert_eq!(sha256(&path, &AtomicBool::new(true)).unwrap(), None);
+    }
+
+    #[test]
+    fn meta_from_video_meta() {
+        let meta = Meta::from(VideoMeta {
+            duration_ms: Some(1000),
+            width: Some(56),
+            height: Some(72),
+            codec: Some("h264".into()),
+            taken_at: Some("2024-05-01T13:00:00".into()),
+        });
+        assert_eq!(meta.dimensions, Some((56, 72)));
+        assert_eq!(meta.duration_ms, Some(1000));
+        assert_eq!(meta.codec.as_deref(), Some("h264"));
+        assert_eq!(meta.taken_at.as_deref(), Some("2024-05-01T13:00:00"));
     }
 }

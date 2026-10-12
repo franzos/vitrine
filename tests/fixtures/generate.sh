@@ -1,6 +1,6 @@
 #!/bin/sh
 # Each format has its own size so tests can tell them apart. Run from the repo root:
-#   guix shell imagemagick libheif libjxl perl-image-exiftool python -- sh tests/fixtures/generate.sh
+#   guix shell ffmpeg imagemagick libheif libjxl perl-image-exiftool python -- sh tests/fixtures/generate.sh
 set -eu
 
 cd "$(dirname "$0")"
@@ -15,6 +15,9 @@ src() {
 convert "$(src 64x48)" -quality 85 jpeg.jpg
 rm -f orientation-6.jpg
 exiftool -q -Orientation#=6 -o orientation-6.jpg jpeg.jpg
+# Lisbon
+rm -f gps.jpg
+exiftool -q -GPSLatitude=38.7223 -GPSLatitudeRef=N -GPSLongitude=9.1393 -GPSLongitudeRef=W -o gps.jpg jpeg.jpg
 convert "$(src 60x44)" -define png:include-chunk=none PNG24:png.png
 convert "$(src 56x40)" -define webp:lossless=true webp.webp
 convert "$(src 52x36)" gif.gif
@@ -31,3 +34,8 @@ convert "$(src 1024x768)" -quality 20 "$tmp/large.jpg"
 convert "$(src 320x240)" -quality 50 "$tmp/thumb.jpg"
 rm -f exif-thumb.jpg
 exiftool -q -Orientation#=6 '-ThumbnailImage<='"$tmp/thumb.jpg" -o exif-thumb.jpg "$tmp/large.jpg"
+# 1 s of testsrc at 72x56, and the same stream tagged to display turned 90 degrees
+ffmpeg -nostdin -v error -y -f lavfi -i testsrc=size=72x56:rate=5:duration=1 -c:v libx264 -pix_fmt yuv420p \
+    -metadata creation_time=2024-05-01T12:00:00Z clip.mp4
+ffmpeg -nostdin -v error -y -display_rotation 90 -i clip.mp4 -c copy \
+    -metadata creation_time=2024-05-01T12:00:00Z clip-rotated.mp4

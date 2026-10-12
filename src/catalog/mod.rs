@@ -1,7 +1,8 @@
-//! The catalog database: images by path, and face data by content hash.
+//! The catalog database: images by path, and face and location data by content hash.
 
 pub mod faces;
 pub mod filter;
+pub mod geo;
 pub mod images;
 pub mod people;
 pub mod runs;
@@ -47,6 +48,14 @@ pub(crate) fn temp() -> (tempfile::TempDir, Connection) {
     (dir, conn)
 }
 
+/// A catalog migrated only up to schema `version`.
+#[cfg(test)]
+pub(crate) fn open_at_version(path: &Path, version: usize) -> Connection {
+    let mut conn = Connection::open(path).unwrap();
+    schema::migrations().to_version(&mut conn, version).unwrap();
+    conn
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -67,7 +76,7 @@ mod tests {
         let version: i64 = again
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, 10);
     }
 
     #[test]

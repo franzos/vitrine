@@ -7,7 +7,7 @@ use rusqlite::types::{FromSql, FromSqlResult, ToSqlOutput, Type, ValueRef};
 use rusqlite::{Connection, OptionalExtension, ToSql, Transaction, params};
 
 use super::images::prefix_range;
-use super::people::PersonId;
+use super::people::{self, Person, PersonId};
 use crate::db::{Error, Result, Sha256, path_str};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -49,6 +49,13 @@ pub struct ClusterFace {
     /// Belongs to an ignored person.
     pub ignored: bool,
     pub embedding: Vec<f32>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImageFace {
+    pub id: FaceId,
+    pub rect: Rect,
+    pub person: Option<Person>,
 }
 
 pub fn register_model(
@@ -256,6 +263,45 @@ pub fn for_clustering(
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
+/// Faces the count filter counts, minus those of ignored people; left to right.
+pub fn of_image(
+    conn: &Connection,
+    sha256: &Sha256,
+    model: ModelId,
+    min_score: f32,
+    min_face_size: u32,
+) -> Result<Vec<ImageFace>> {
+    let sql = format!(
+        "SELECT fc.id, fc.x, fc.y, fc.w, fc.h, {} FROM faces fc
+         LEFT JOIN people p ON p.id = fc.person_id
+         WHERE fc.sha256 = ?1 AND fc.model_id = ?2 AND fc.not_a_face = 0
+           AND fc.score >= ?3 AND min(fc.w, fc.h) >= ?4 AND p.ignored IS NOT 1
+         ORDER BY fc.x, fc.id",
+        people::COLUMNS
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(
+        params![sha256, model.0, f64::from(min_score), min_face_size],
+        |row| {
+            let person = row
+                .get::<_, Option<i64>>(5)?
+                .map(|_| people::from_row(row, 5))
+                .transpose()?;
+            Ok(ImageFace {
+                id: FaceId(row.get(0)?),
+                rect: Rect {
+                    x: row.get(1)?,
+                    y: row.get(2)?,
+                    w: row.get(3)?,
+                    h: row.get(4)?,
+                },
+                person,
+            })
+        },
+    )?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
 pub fn unclustered(conn: &Connection, model: ModelId) -> Result<bool> {
     Ok(conn.query_row(
         "SELECT EXISTS (
@@ -362,7 +408,7 @@ pub(crate) mod tests {
         ids
     }
 
-    fn image(conn: &Connection, path: &str, sha: Sha256) -> images::ImageId {
+    pub(crate) fn image(conn: &Connection, path: &str, sha: Sha256) -> images::ImageId {
         images::upsert(
             conn,
             &NewImage {
@@ -374,6 +420,8 @@ pub(crate) mod tests {
                 width: None,
                 height: None,
                 taken_at: None,
+                duration_ms: None,
+                codec: None,
             },
         )
         .unwrap()
@@ -662,6 +710,77 @@ pub(crate) mod tests {
             .map(|f| f.id)
             .collect();
         assert_eq!(kept, [ids[0]]);
+    }
+
+    #[test]
+    fn of_image_applies_the_count_filter_and_skips_ignored_people() {
+        let (_dir, mut conn) = temp();
+        let model = register_model(&conn, "m", "d", 2).unwrap();
+        let other = register_model(&conn, "o", "d", 2).unwrap();
+        let e = [0.5_f32, -0.5];
+        let at = |x: f32, side: f32, score: f32| NewFace {
+            rect: Rect {
+                x,
+                y: 5.0,
+                w: side,
+                h: side * 2.0,
+            },
+            score,
+            ..face(&e)
+        };
+        let tx = conn.transaction().unwrap();
+        let ids = insert_scan(
+            &tx,
+            &[1; 32],
+            model,
+            &[
+                at(30.0, 40.0, 0.6),
+                at(10.0, 40.0, 0.9),
+                at(20.0, 39.9, 0.9),
+                at(25.0, 80.0, 0.59),
+                at(30.0, 80.0, 0.9),
+                at(5.0, 80.0, 0.9),
+                at(0.0, 80.0, 0.9),
+            ],
+        )
+        .unwrap();
+        insert_scan(&tx, &[2; 32], model, &[at(0.0, 80.0, 0.9)]).unwrap();
+        insert_scan(&tx, &[1; 32], other, &[at(0.0, 80.0, 0.9)]).unwrap();
+        tx.commit().unwrap();
+        set_not_a_face(&conn, ids[4]).unwrap();
+        let ada = people::create(&conn, model).unwrap();
+        crate::catalog::edit(&mut conn, |tx| people::rename(tx, ada, Some("Ada")));
+        assign(&conn, ids[1], ada, AssignedBy::Manual).unwrap();
+        assign(&conn, ids[6], ada, AssignedBy::Manual).unwrap();
+
+        let got = of_image(&conn, &[1; 32], model, 0.6, 40).unwrap();
+        assert_eq!(
+            got.iter().map(|f| f.id).collect::<Vec<_>>(),
+            [ids[6], ids[5], ids[1], ids[0]]
+        );
+        assert_eq!(
+            counts(&conn, model, 0.6, 40).unwrap()[&[1; 32]] as usize,
+            got.len()
+        );
+        assert_eq!(
+            got[2].rect,
+            Rect {
+                x: 10.0,
+                y: 5.0,
+                w: 40.0,
+                h: 80.0,
+            }
+        );
+        let ada_row = people::list(&conn, model).unwrap().remove(0);
+        assert_eq!(got[2].person.as_ref(), Some(&ada_row));
+        assert_eq!(got[3].person, None);
+
+        crate::catalog::edit(&mut conn, |tx| people::set_ignored(tx, ada, true));
+        let got = of_image(&conn, &[1; 32], model, 0.6, 40).unwrap();
+        assert_eq!(
+            got.iter().map(|f| f.id).collect::<Vec<_>>(),
+            [ids[5], ids[0]]
+        );
     }
 
     #[test]

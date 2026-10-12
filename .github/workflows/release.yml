@@ -1,0 +1,106 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # A clean image, so libheif only links the codecs installed below; built on 24.04 for its older glibc.
+    container: ubuntu:24.04
+    env:
+      TURBOJPEG_STATIC: "1"
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential ca-certificates cmake curl git nasm pkg-config \
+            libde265-dev libdav1d-dev
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+
+      - name: Install packagers
+        run: cargo install --locked cargo-deb
+
+      - name: Build
+        run: cargo build --release --locked --features vendored
+
+      - name: Package
+        run: |
+          mkdir dist
+          tar czf dist/vitrine-x86_64-unknown-linux-gnu.tar.gz -C target/release vitrine
+          (cd dist && sha256sum vitrine-x86_64-unknown-linux-gnu.tar.gz > vitrine-x86_64-unknown-linux-gnu.tar.gz.sha256)
+          cargo deb --no-build --output dist/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: vitrine-linux
+          path: dist/*
+
+  release:
+    needs: [build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the GitHub release and upload assets
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          merge-multiple: true
+
+      - name: Extract release notes
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v hdr="## [$version]" 'index($0, hdr) == 1 { f = 1; next } /^## \[/ { f = 0 } f' CHANGELOG.md > NOTES.md
+
+      - name: Create release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          body_path: NOTES.md
+          draft: false
+          files: |
+            vitrine-*.tar.gz
+            vitrine-*.tar.gz.sha256
+            *.deb
+
+  # Hash the exact release artifacts, so the SLSA provenance subjects match what a verifier downloads.
+  hashes:
+    needs: [build]
+    runs-on: ubuntu-latest
+    outputs:
+      hashes: ${{ steps.hash.outputs.hashes }}
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          merge-multiple: true
+
+      - name: Compute subject hashes
+        id: hash
+        run: |
+          sha256sum vitrine-*.tar.gz *.deb > SHA256SUMS
+          echo "hashes=$(base64 -w0 SHA256SUMS)" >> "$GITHUB_OUTPUT"
+
+  # Keyless SLSA build provenance (OIDC -> Sigstore), attached to the release.
+  # The generator must be referenced by tag, not SHA, so slsa-verifier can resolve the trusted builder.
+  provenance:
+    needs: [hashes, release]
+    permissions:
+      id-token: write # keyless signing via OIDC
+      contents: write # attach the provenance to the release
+      actions: read
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0
+    with:
+      base64-subjects: ${{ needs.hashes.outputs.hashes }}
+      upload-assets: true
