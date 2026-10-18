@@ -56,7 +56,12 @@ pub struct ImageFace {
     pub id: FaceId,
     pub rect: Rect,
     pub person: Option<Person>,
+    /// Faces of `person` scoring below [`LOW_SCORE`].
+    pub low_faces: u64,
 }
+
+/// Below this, detections are mostly blurry, turned or tiny; clusters of them are rarely one person.
+pub const LOW_SCORE: f32 = 0.65;
 
 pub fn register_model(
     conn: &Connection,
@@ -263,7 +268,7 @@ pub fn for_clustering(
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
-/// Faces the count filter counts, minus those of ignored people; left to right.
+/// Faces the count filter counts, left to right.
 pub fn of_image(
     conn: &Connection,
     sha256: &Sha256,
@@ -272,16 +277,24 @@ pub fn of_image(
     min_face_size: u32,
 ) -> Result<Vec<ImageFace>> {
     let sql = format!(
-        "SELECT fc.id, fc.x, fc.y, fc.w, fc.h, {} FROM faces fc
+        "SELECT fc.id, fc.x, fc.y, fc.w, fc.h, {},
+           (SELECT count(*) FROM faces g WHERE g.person_id = fc.person_id AND g.score < ?5)
+         FROM faces fc
          LEFT JOIN people p ON p.id = fc.person_id
          WHERE fc.sha256 = ?1 AND fc.model_id = ?2 AND fc.not_a_face = 0
-           AND fc.score >= ?3 AND min(fc.w, fc.h) >= ?4 AND p.ignored IS NOT 1
+           AND fc.score >= ?3 AND min(fc.w, fc.h) >= ?4
          ORDER BY fc.x, fc.id",
         people::COLUMNS
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(
-        params![sha256, model.0, f64::from(min_score), min_face_size],
+        params![
+            sha256,
+            model.0,
+            f64::from(min_score),
+            min_face_size,
+            f64::from(LOW_SCORE)
+        ],
         |row| {
             let person = row
                 .get::<_, Option<i64>>(5)?
@@ -296,6 +309,7 @@ pub fn of_image(
                     h: row.get(4)?,
                 },
                 person,
+                low_faces: row.get(10)?,
             })
         },
     )?;
@@ -777,10 +791,8 @@ pub(crate) mod tests {
 
         crate::catalog::edit(&mut conn, |tx| people::set_ignored(tx, ada, true));
         let got = of_image(&conn, &[1; 32], model, 0.6, 40).unwrap();
-        assert_eq!(
-            got.iter().map(|f| f.id).collect::<Vec<_>>(),
-            [ids[5], ids[0]]
-        );
+        assert_eq!(got.len(), 4);
+        assert!(got[2].person.as_ref().unwrap().ignored);
     }
 
     #[test]

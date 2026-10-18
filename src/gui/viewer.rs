@@ -16,6 +16,7 @@ use image::DynamicImage;
 
 use super::grid::Grid;
 use super::info_panel::{self, Info};
+use super::people_panel::Edit;
 use super::place_picker::{Pick, PlacePicker};
 use crate::catalog::faces;
 use crate::catalog::geo::Location;
@@ -44,6 +45,8 @@ pub enum Action {
     /// Shows the image under the cursor at its map point.
     ShowOnMap,
     OpenPerson(PersonId),
+    /// A face or person edit from the Info panel.
+    Edit(Edit),
 }
 
 /// The location shown in the bottom bar and the Info panel.

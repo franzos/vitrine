@@ -38,7 +38,7 @@ pub fn single<K: Clone + PartialEq>(
     };
     let id = ui.make_persistent_id(salt);
     let button = ui.button(title);
-    let picked = popup(ui, &button, id, rows, |ui, matches, enter| {
+    let picked = popup(ui, &button, id, rows, |ui, matches, enter, _| {
         let mut picked = None;
         if enter && let Some(row) = matches.first() {
             picked = Some(Some(row.key.clone()));
@@ -84,7 +84,7 @@ pub fn multi<K: Clone + Ord>(
     };
     let id = ui.make_persistent_id(salt);
     let button = ui.button(title);
-    let toggled = popup(ui, &button, id, rows, |ui, matches, enter| {
+    let toggled = popup(ui, &button, id, rows, |ui, matches, enter, _| {
         let mut toggled = None;
         if enter && let Some(row) = matches.first() {
             toggled = Some(row.key.clone());
@@ -105,13 +105,61 @@ pub fn multi<K: Clone + Ord>(
     Some(toggled)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Pick<K> {
+    Row(K),
+    New(String),
+}
+
+/// A `caption` button opening a searchable list with a "New: <query>" row unless a row matches exactly; Enter picks the first row shown.
+pub fn pick_or_new<K: Clone>(
+    ui: &mut egui::Ui,
+    salt: impl egui::AsIdSalt,
+    caption: impl Into<egui::WidgetText>,
+    rows: &[Row<'_, K>],
+) -> (egui::Response, Option<Pick<K>>) {
+    let id = ui.make_persistent_id(salt);
+    let button = ui.button(caption);
+    let picked = popup(ui, &button, id, rows, |ui, matches, enter, query| {
+        let mut picked = None;
+        list(ui, matches, |ui, row| {
+            let text = row.text();
+            let button = ui.add(egui::Button::selectable(false, text.as_ref()).truncate());
+            if button.on_hover_text(text).clicked() {
+                picked = Some(Pick::Row(row.key.clone()));
+            }
+        });
+        let exact = matches.iter().any(|r| r.label.eq_ignore_ascii_case(query));
+        if !query.is_empty()
+            && !exact
+            && ui
+                .selectable_label(false, format!("New: {query}"))
+                .clicked()
+        {
+            picked = Some(Pick::New(query.to_owned()));
+        }
+        if enter && picked.is_none() {
+            picked = match matches.first() {
+                Some(row) => Some(Pick::Row(row.key.clone())),
+                None if !query.is_empty() => Some(Pick::New(query.to_owned())),
+                None => None,
+            };
+        }
+        if picked.is_some() {
+            ui.close();
+        }
+        picked
+    });
+    (button, picked.flatten())
+}
+
 /// The search field and `rows`; `None` while closed. The query lives in temp memory until the popup closes.
 fn popup<'r, 'a, K, R>(
     ui: &egui::Ui,
     button: &egui::Response,
     id: Id,
     rows: &'r [Row<'a, K>],
-    add_rows: impl FnOnce(&mut egui::Ui, &[&'r Row<'a, K>], bool) -> R,
+    add_rows: impl FnOnce(&mut egui::Ui, &[&'r Row<'a, K>], bool, &str) -> R,
 ) -> Option<R> {
     let query_id = id.with("query");
     let shown = Popup::from_toggle_button_response(button)
@@ -144,8 +192,9 @@ fn popup<'r, 'a, K, R>(
                 .iter()
                 .filter(|r| r.label.to_lowercase().contains(&needle))
                 .collect();
+            let picked = add_rows(ui, &matches, enter, query.trim());
             ui.data_mut(|d| d.insert_temp(query_id, query));
-            add_rows(ui, &matches, enter)
+            picked
         });
     if shown.is_none() {
         ui.data_mut(|d| d.remove::<String>(query_id));
@@ -159,8 +208,10 @@ fn list<K>(
     mut add_row: impl FnMut(&mut egui::Ui, &Row<'_, K>),
 ) {
     let height = ui.spacing().interact_size.y;
+    // full width, else it resizes to the rows in view while scrolling
     ScrollArea::vertical()
         .max_height(MAX_HEIGHT)
+        .auto_shrink([false, true])
         .show_rows(ui, height, rows.len(), |ui, range| {
             for row in &rows[range] {
                 add_row(ui, row);

@@ -783,9 +783,11 @@ impl VitrineApp {
                 coords: self.point,
                 recent: &self.recent,
             };
+            let (crops, people) = self.people_panel.crops_and_people();
             let mut info = Info {
                 data: self.info.as_ref(),
-                crops: self.people_panel.crops(),
+                crops,
+                people,
             };
             let action = CentralPanel::default()
                 .frame(Frame::NONE)
@@ -807,6 +809,7 @@ impl VitrineApp {
                     self.show_on_map(gl);
                     ui.ctx().request_repaint();
                 }
+                Some(viewer::Action::Edit(edit)) => self.edit(&edit),
                 Some(viewer::Action::OpenPerson(person)) => {
                     self.viewer.close(gl);
                     self.grid.reveal();
@@ -3054,9 +3057,9 @@ mod tests {
         catalog::people::set_ignored(&tx, faces.second, true).unwrap();
         tx.commit().unwrap();
         reload(&mut harness);
-        harness.get_by_label("People (1)");
+        harness.get_by_label("People (2)");
         harness.get_by_label("unnamed #1");
-        assert!(harness.query_by_label("unnamed #2").is_none());
+        harness.get_by_label("unnamed #2, ignored");
 
         conn.execute(
             "UPDATE faces SET person_id = NULL, assigned_by = NULL WHERE id IN (?1, ?2)",
@@ -3087,17 +3090,203 @@ mod tests {
     }
 
     #[test]
-    fn gui_clicking_a_person_in_the_info_panel_opens_them() {
+    fn gui_show_in_people_from_the_info_panel_opens_them() {
         let (fixture, faces) = face_fixture();
         let mut harness = face_harness(&fixture, true);
         let id = open_in_viewer(&mut harness, "png.png");
         click_info(&mut harness);
-        harness.get_by_label("unnamed #1").click();
+        harness.get_all_by_label("...").next().unwrap().click();
+        harness.run_steps(2);
+        harness.get_by_label("Show in People").click();
         harness.run_steps(2);
         let app = harness.state();
         assert_eq!(app.opened(), None);
         assert_eq!(app.people_panel.opened(), Some(faces.first));
         assert_eq!(app.nav().current().map(|e| e.id), Some(id));
+    }
+
+    /// Opens the picker of the face row captioned `caption` and types `query`.
+    fn pick_face(harness: &mut Harness<'_, VitrineApp>, caption: &str, query: &str) {
+        harness.get_by_label(caption).click();
+        harness.run_steps(2);
+        harness.get_by_label("Search").type_text(query);
+        harness.run_steps(1);
+    }
+
+    #[test]
+    fn gui_naming_an_unnamed_person_in_the_info_panel_names_the_whole_person() {
+        let (fixture, faces) = face_fixture();
+        let mut harness = face_harness(&fixture, true);
+        let id = open_in_viewer(&mut harness, "png.png");
+        click_info(&mut harness);
+        pick_face(&mut harness, "unnamed #1", "Ada");
+        harness.get_by_label("New: Ada").click();
+        harness.run_steps(2);
+        harness.get_by_label("unnamed #1 has 2 faces. Name all of them \"Ada\", or only this one?");
+        assert!(harness.query_by_label_contains("low-confidence").is_none());
+        assert_eq!(people_in(&fixture)[0].name, None, "named before confirming");
+        harness.get_by_label("All 2 faces").click();
+        harness.run_steps(2);
+        assert!(harness.query_by_label("All 2 faces").is_none());
+        let ada = people_in(&fixture)
+            .into_iter()
+            .find(|p| p.id == faces.first)
+            .unwrap();
+        assert_eq!((ada.name.as_deref(), ada.faces), (Some("Ada"), 2));
+        assert_eq!(harness.state().opened(), Some(id));
+        harness.get_by_label("Ada");
+        harness.get_by_label("unnamed #2");
+    }
+
+    #[test]
+    fn gui_only_this_face_names_one_face_and_low_scores_warn() {
+        let (fixture, faces) = face_fixture();
+        let conn = catalog::open(&fixture.paths.catalog_db()).unwrap();
+        conn.execute(
+            "UPDATE faces SET score = 0.61 WHERE person_id = ?1",
+            [faces.first.0],
+        )
+        .unwrap();
+        let mut harness = face_harness(&fixture, true);
+        open_in_viewer(&mut harness, "png.png");
+        click_info(&mut harness);
+        pick_face(&mut harness, "unnamed #1", "Ada");
+        harness.key_press(egui::Key::Enter);
+        harness.run_steps(2);
+        harness.get_by_label_contains("2 of the 2 are low-confidence detections");
+
+        harness.get_by_label("Cancel").click();
+        harness.run_steps(2);
+        assert!(harness.query_by_label_contains("low-confidence").is_none());
+        assert_eq!(people_in(&fixture).len(), 2);
+
+        pick_face(&mut harness, "unnamed #1", "Ada");
+        harness.key_press(egui::Key::Enter);
+        harness.run_steps(2);
+        harness.get_by_label("Only this face").click();
+        harness.run_steps(2);
+        let people = people_in(&fixture);
+        let ada = people
+            .iter()
+            .find(|p| p.name.as_deref() == Some("Ada"))
+            .unwrap();
+        assert_eq!(ada.faces, 1);
+        assert_eq!(face_row(&fixture, faces.first_faces[1]).0, Some(ada.id.0));
+        let first = people.iter().find(|p| p.id == faces.first).unwrap();
+        assert_eq!((first.name.as_deref(), first.faces), (None, 1));
+    }
+
+    #[test]
+    fn gui_picking_a_person_for_an_unnamed_one_merges_them() {
+        let (fixture, faces) = face_fixture();
+        let mut harness = face_harness(&fixture, true);
+        open_in_viewer(&mut harness, "png.png");
+        click_info(&mut harness);
+        pick_face(&mut harness, "unnamed #2", "#1");
+        harness.key_press(egui::Key::Enter);
+        harness.run_steps(2);
+        harness.get_by_label("All 2 faces").click();
+        harness.run_steps(2);
+        let people = people_in(&fixture);
+        assert_eq!(people.len(), 1);
+        assert_eq!((people[0].id, people[0].faces), (faces.first, 4));
+        assert!(
+            harness.state().opened().is_some(),
+            "Enter closed the viewer"
+        );
+    }
+
+    #[test]
+    fn gui_naming_an_unknown_face_in_the_info_panel_creates_a_person() {
+        let (fixture, faces) = face_fixture();
+        let conn = catalog::open(&fixture.paths.catalog_db()).unwrap();
+        catalog::faces::unassign(&conn, faces.second_faces[0]).unwrap();
+        let mut harness = face_harness(&fixture, true);
+        open_in_viewer(&mut harness, "png.png");
+        click_info(&mut harness);
+        pick_face(&mut harness, "Unknown", "Bea");
+        harness.key_press(egui::Key::Enter);
+        harness.run_steps(2);
+        let bea = people_in(&fixture)
+            .into_iter()
+            .find(|p| p.name.as_deref() == Some("Bea"))
+            .unwrap();
+        assert_eq!(bea.faces, 1);
+        assert_eq!(
+            face_row(&fixture, faces.second_faces[0]),
+            (Some(bea.id.0), Some("manual".to_owned()), false)
+        );
+        harness.get_by_label("Bea");
+
+        // a named person's row moves only that face
+        pick_face(&mut harness, "Bea", "unnamed #1");
+        harness.key_press(egui::Key::Enter);
+        harness.run_steps(2);
+        assert_eq!(
+            face_row(&fixture, faces.second_faces[0]),
+            (Some(faces.first.0), Some("manual".to_owned()), false)
+        );
+        assert!(people_in(&fixture).iter().any(|p| p.id == bea.id));
+    }
+
+    #[test]
+    fn gui_ignoring_unknown_faces_gives_each_its_own_ignored_person() {
+        let (fixture, faces) = face_fixture();
+        let conn = catalog::open(&fixture.paths.catalog_db()).unwrap();
+        let unknown = [faces.first_faces[1], faces.second_faces[0]];
+        for face in unknown {
+            catalog::faces::unassign(&conn, face).unwrap();
+        }
+        let mut harness = face_harness(&fixture, true);
+        open_in_viewer(&mut harness, "png.png");
+        click_info(&mut harness);
+        for row in 0..unknown.len() {
+            harness.get_all_by_label("...").nth(row).unwrap().click();
+            harness.run_steps(2);
+            harness.get_by_label("Ignore").click();
+            harness.run_steps(2);
+        }
+        let people = people_in(&fixture);
+        let owners: Vec<_> = unknown
+            .iter()
+            .map(|face| {
+                let (person, by, _) = face_row(&fixture, *face);
+                assert_eq!(by.as_deref(), Some("manual"));
+                people.iter().find(|p| Some(p.id.0) == person).unwrap()
+            })
+            .collect();
+        assert_ne!(owners[0].id, owners[1].id);
+        for owner in &owners {
+            assert_eq!(
+                (owner.name.as_deref(), owner.ignored, owner.faces),
+                (None, true, 1)
+            );
+        }
+        harness.get_by_label("People (2)");
+        assert_eq!(harness.query_all_by_label_contains(", ignored").count(), 2);
+
+        harness.get_all_by_label("...").next().unwrap().click();
+        harness.run_steps(2);
+        harness.get_by_label("Unignore person").click();
+        harness.run_steps(2);
+        assert_eq!(people_in(&fixture).iter().filter(|p| p.ignored).count(), 1);
+    }
+
+    #[test]
+    fn gui_info_panel_marks_a_face_as_not_a_face() {
+        let (fixture, faces) = face_fixture();
+        let mut harness = face_harness(&fixture, true);
+        open_in_viewer(&mut harness, "png.png");
+        click_info(&mut harness);
+        harness.get_all_by_label("...").next().unwrap().click();
+        harness.run_steps(2);
+        harness.get_by_label("Not a face").click();
+        harness.run_steps(2);
+        assert_eq!(
+            face_row(&fixture, faces.first_faces[1]),
+            (None, Some("manual".to_owned()), true)
+        );
+        harness.get_by_label("People (1)");
     }
 
     #[test]

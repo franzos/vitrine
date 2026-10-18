@@ -6,12 +6,14 @@ use eframe::egui::{
 
 use super::crops::Crops;
 use super::mini_map;
-use super::people_panel::{self, crop};
+use super::people_panel::{self, Edit, crop};
 use super::place_picker::{self, PlacePicker};
+use super::search_pick::{self, Pick};
 use super::viewer::{Action, Places};
-use crate::catalog::faces::{self, ImageFace};
+use crate::catalog::faces::{self, FaceId, ImageFace};
 use crate::catalog::geo::Source;
 use crate::catalog::images::{Entry, Image, ImageId, Kind};
+use crate::catalog::people::{Person, PersonId};
 use crate::video;
 
 pub const WIDTH: f32 = 300.0;
@@ -31,6 +33,8 @@ pub struct Info<'a> {
     /// Belongs to the previous image for a frame after the cursor moves.
     pub data: Option<&'a InfoData>,
     pub crops: &'a mut Crops,
+    /// Choices of the face pickers.
+    pub people: &'a [Person],
 }
 
 #[derive(Default)]
@@ -63,7 +67,7 @@ pub(super) fn show(
             if entry.kind == Kind::Image {
                 location(ui, entry, places, picker, &mut out);
                 if let Some(faces) = data.and_then(|d| d.faces.as_deref()) {
-                    people(ui, faces, info.crops, &mut out);
+                    people(ui, faces, info.crops, info.people, &mut out);
                 }
             }
             if let Some(data) = data {
@@ -144,7 +148,13 @@ fn location(
         });
 }
 
-fn people(ui: &mut egui::Ui, faces: &[ImageFace], crops: &mut Crops, out: &mut Output) {
+fn people(
+    ui: &mut egui::Ui,
+    faces: &[ImageFace],
+    crops: &mut Crops,
+    people: &[Person],
+    out: &mut Output,
+) {
     CollapsingHeader::new(format!("People ({})", faces.len()))
         .id_salt("info_people")
         .default_open(true)
@@ -153,6 +163,26 @@ fn people(ui: &mut egui::Ui, faces: &[ImageFace], crops: &mut Crops, out: &mut O
                 ui.weak("No faces");
                 return;
             }
+            let confirm_id = Id::new("info_name_confirm");
+            let mut pending = ui
+                .data(|d| d.get_temp::<(FaceId, Pick<PersonId>)>(confirm_id))
+                .and_then(|(id, pick)| Some((faces.iter().find(|f| f.id == id)?, pick)));
+            if let Some((face, pick)) = &pending {
+                out.hovered = Some(face.rect);
+                if let Some(whole) = confirm(ui, face, pick, people) {
+                    out.action = whole.map(|whole| Action::Edit(edit(face, pick, whole)));
+                    pending = None;
+                }
+            }
+            let rows: Vec<_> = people
+                .iter()
+                .filter(|p| !p.ignored)
+                .map(|p| search_pick::Row {
+                    key: p.id,
+                    label: people_panel::name(p).into(),
+                    count: Some(p.faces),
+                })
+                .collect();
             ScrollArea::vertical()
                 .id_salt("info_people_list")
                 .max_height(PEOPLE_HEIGHT)
@@ -161,18 +191,16 @@ fn people(ui: &mut egui::Ui, faces: &[ImageFace], crops: &mut Crops, out: &mut O
                     for face in &faces[range] {
                         let row = ui.horizontal(|ui| {
                             crop(ui, crops, Some(face.id), THUMB);
-                            match &face.person {
-                                Some(person) => ui
-                                    .selectable_label(false, people_panel::name(person))
-                                    .clicked()
-                                    .then_some(Action::OpenPerson(person.id)),
-                                None => {
-                                    // lines up with the selectable names' text
-                                    ui.add_space(ui.spacing().button_padding.x);
-                                    ui.label("Unknown");
-                                    None
+                            // before the name, which takes the rest of the row
+                            let menu = face_menu(ui, face);
+                            if let Some(pick) = name_picker(ui, face, &rows) {
+                                if cluster_size(face) > 1 {
+                                    pending = Some((face, pick));
+                                } else {
+                                    return Some(Action::Edit(edit(face, &pick, true)));
                                 }
                             }
+                            menu
                         });
                         if let Some(action) = row.inner {
                             out.action = Some(action);
@@ -185,7 +213,136 @@ fn people(ui: &mut egui::Ui, faces: &[ImageFace], crops: &mut Crops, out: &mut O
                         }
                     }
                 });
+            let pending = pending.map(|(face, pick)| (face.id, pick));
+            ui.data_mut(|d| match pending {
+                Some(pending) => {
+                    d.insert_temp(confirm_id, pending);
+                }
+                None => d.remove::<(FaceId, Pick<PersonId>)>(confirm_id),
+            });
         });
+}
+
+/// Faces of the unnamed person holding `face`, which a pick would name as a whole; 0 otherwise.
+fn cluster_size(face: &ImageFace) -> u64 {
+    face.person
+        .as_ref()
+        .filter(|p| p.name.is_none())
+        .map_or(0, |p| p.faces)
+}
+
+/// `whole` names or merges the face's unnamed person; otherwise only the face moves.
+fn edit(face: &ImageFace, pick: &Pick<PersonId>, whole: bool) -> Edit {
+    let unnamed = face
+        .person
+        .as_ref()
+        .filter(|p| whole && p.name.is_none())
+        .map(|p| p.id);
+    match (pick.clone(), unnamed) {
+        (Pick::Row(into), Some(from)) => Edit::Merge { from, into },
+        (Pick::New(name), Some(person)) => Edit::Rename(person, Some(name)),
+        (Pick::Row(person), None) => Edit::Assign(face.id, person),
+        (Pick::New(name), None) => Edit::NameFace(face.id, name),
+    }
+}
+
+/// Asks whether a pick applies to the face's whole unnamed person; `Some(None)` cancels.
+fn confirm(
+    ui: &mut egui::Ui,
+    face: &ImageFace,
+    pick: &Pick<PersonId>,
+    people: &[Person],
+) -> Option<Option<bool>> {
+    let person = face.person.as_ref()?;
+    let target = match pick {
+        Pick::New(name) => name.clone(),
+        Pick::Row(id) => people
+            .iter()
+            .find(|p| p.id == *id)
+            .map_or_else(|| format!("#{}", id.0), people_panel::name),
+    };
+    let n = person.faces;
+    ui.group(|ui| {
+        ui.label(format!(
+            "{} has {n} faces. Name all of them \"{target}\", or only this one?",
+            people_panel::name(person)
+        ));
+        if face.low_faces * 2 >= n {
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                format!(
+                    "{} of the {n} are low-confidence detections; this group is probably several people.",
+                    face.low_faces
+                ),
+            );
+        }
+        let mut answer = None;
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Only this face").clicked() {
+                answer = Some(Some(false));
+            }
+            if ui.button(format!("All {n} faces")).clicked() {
+                answer = Some(Some(true));
+            }
+            if ui.button("Cancel").clicked() {
+                answer = Some(None);
+            }
+        });
+        answer
+    })
+    .inner
+}
+
+fn name_picker(
+    ui: &mut egui::Ui,
+    face: &ImageFace,
+    rows: &[search_pick::Row<'_, PersonId>],
+) -> Option<Pick<PersonId>> {
+    let caption = match &face.person {
+        Some(person) if person.ignored => format!("{}, ignored", people_panel::name(person)),
+        Some(person) => people_panel::name(person),
+        None => "Unknown".to_owned(),
+    };
+    let caption = people_panel::two_lines(ui, caption);
+    search_pick::pick_or_new(ui, ("info_face", face.id.0), caption, rows).1
+}
+
+fn face_menu(ui: &mut egui::Ui, face: &ImageFace) -> Option<Action> {
+    ui.menu_button("...", |ui| {
+        let person = face.person.as_ref();
+        let mut action = None;
+        if let Some(person) = person
+            && ui.button("Show in People").clicked()
+        {
+            action = Some(Action::OpenPerson(person.id));
+        }
+        if ui.button("Not a face").clicked() {
+            action = Some(Action::Edit(Edit::NotAFace(face.id)));
+        }
+        match person {
+            Some(person) => {
+                if ui.button("Unassign").clicked() {
+                    action = Some(Action::Edit(Edit::Unassign(face.id)));
+                }
+                let ignore = if person.ignored {
+                    "Unignore person"
+                } else {
+                    "Ignore person"
+                };
+                if ui.button(ignore).clicked() {
+                    action = Some(Action::Edit(Edit::Ignore(person.id, !person.ignored)));
+                }
+            }
+            None => {
+                if ui.button("Ignore").clicked() {
+                    action = Some(Action::Edit(Edit::IgnoreFace(face.id)));
+                }
+            }
+        }
+        action
+    })
+    .inner
+    .flatten()
 }
 
 fn details(ui: &mut egui::Ui, image: &Image, size: Option<Vec2>) {

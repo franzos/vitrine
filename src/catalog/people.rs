@@ -41,6 +41,25 @@ pub fn create(conn: &Connection, model: ModelId) -> Result<PersonId> {
     Ok(PersonId(id))
 }
 
+/// A new person in the face's model, with the face assigned manually.
+pub fn create_from_face(
+    tx: &Transaction<'_>,
+    face: FaceId,
+    name: Option<&str>,
+) -> Result<PersonId> {
+    let id = tx.query_row(
+        "INSERT INTO people (model_id, name)
+         SELECT model_id, ?2 FROM faces WHERE id = ?1 RETURNING id",
+        params![face.0, name],
+        |row| row.get(0),
+    )?;
+    tx.execute(
+        "UPDATE faces SET person_id = ?2, assigned_by = 'manual' WHERE id = ?1",
+        [face.0, id],
+    )?;
+    Ok(PersonId(id))
+}
+
 /// Also pins the person's auto faces as manual.
 pub fn rename(tx: &Transaction<'_>, person: PersonId, name: Option<&str>) -> Result<()> {
     tx.execute(
@@ -178,6 +197,32 @@ mod tests {
         );
         edit(&mut conn, |tx| rename(tx, bob, None));
         assert_eq!(list(&conn, model).unwrap()[1].name, None);
+    }
+
+    #[test]
+    fn create_from_face_names_a_person_of_the_faces_model() {
+        let (_dir, mut conn) = temp();
+        let model = register_model(&conn, "m", "d", 2).unwrap();
+        let face = scan(&mut conn, [1; 32], model, 1)[0];
+        let mut ada = None;
+        edit(&mut conn, |tx| {
+            ada = Some(create_from_face(tx, face, Some("Ada"))?);
+            Ok(())
+        });
+        let got = list(&conn, model).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(
+            (Some(got[0].id), got[0].name.as_deref(), got[0].faces),
+            (ada, Some("Ada"), 1)
+        );
+        let by: AssignedBy = conn
+            .query_row(
+                "SELECT assigned_by FROM faces WHERE id = ?1",
+                [face.0],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(by, AssignedBy::Manual);
     }
 
     #[test]

@@ -1,13 +1,16 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
+use std::sync::Arc;
 
+use eframe::egui::text::TextWrapping;
 use eframe::egui::{
-    self, Color32, ComboBox, Id, Key, Modifiers, Rect, ScrollArea, Sense, TextEdit, Vec2, pos2,
+    self, Align, Color32, ComboBox, FontSelection, Galley, Id, Key, Modifiers, Rect, ScrollArea,
+    Sense, TextEdit, TextStyle, Vec2, WidgetText, pos2,
 };
 use rusqlite::{Connection, Transaction};
 
 use super::crops::Crops;
-use crate::catalog::faces::{self, FaceId};
+use crate::catalog::faces::{self, AssignedBy, FaceId};
 use crate::catalog::people::{self, Person, PersonId};
 use crate::db;
 
@@ -28,6 +31,11 @@ pub enum Edit {
     },
     Unassign(FaceId),
     NotAFace(FaceId),
+    Assign(FaceId, PersonId),
+    /// A new person with this name, holding just the face.
+    NameFace(FaceId, String),
+    /// A new ignored person holding just the face, so it isn't merged with other strangers.
+    IgnoreFace(FaceId),
 }
 
 impl Edit {
@@ -45,6 +53,16 @@ impl Edit {
             }
             Self::Unassign(face) => faces::unassign(conn, *face),
             Self::NotAFace(face) => faces::set_not_a_face(conn, *face),
+            Self::Assign(face, person) => {
+                faces::assign(conn, *face, *person, AssignedBy::Manual).map(drop)
+            }
+            Self::NameFace(face, name) => in_transaction(conn, |tx| {
+                people::create_from_face(tx, *face, Some(name)).map(drop)
+            }),
+            Self::IgnoreFace(face) => in_transaction(conn, |tx| {
+                let person = people::create_from_face(tx, *face, None)?;
+                people::set_ignored(tx, person, true)
+            }),
         }
     }
 }
@@ -125,8 +143,8 @@ impl PeoplePanel {
         &self.people
     }
 
-    pub fn crops(&mut self) -> &mut Crops {
-        &mut self.crops
+    pub fn crops_and_people(&mut self) -> (&mut Crops, &[Person]) {
+        (&mut self.crops, &self.people)
     }
 
     #[cfg(test)]
@@ -201,7 +219,7 @@ impl PeoplePanel {
                         if person.ignored {
                             text.push_str(", ignored");
                         }
-                        if ui.selectable_label(false, text).clicked() {
+                        if ui.selectable_label(false, two_lines(ui, text)).clicked() {
                             clicked = Some(person.id);
                         }
                     });
@@ -348,6 +366,23 @@ impl PeoplePanel {
 }
 
 /// Draws the crop of `face` in a `size` square; empty while loading, failed or `None`.
+/// Button text wrapped to the remaining width, cut with an ellipsis after two lines to fit a fixed row.
+pub(super) fn two_lines(ui: &egui::Ui, text: impl Into<WidgetText>) -> Arc<Galley> {
+    let wrapping = TextWrapping {
+        max_width: ui.available_width() - 2.0 * ui.spacing().button_padding.x,
+        max_rows: 2,
+        break_anywhere: false,
+        overflow_character: Some('…'),
+    };
+    text.into().into_galley_impl(
+        ui.ctx(),
+        ui.style(),
+        wrapping,
+        FontSelection::Style(TextStyle::Button),
+        Align::Min,
+    )
+}
+
 pub(super) fn crop(ui: &mut egui::Ui, crops: &mut Crops, face: Option<FaceId>, size: f32) {
     let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
     let texture = face.and_then(|face| crops.get(ui.ctx(), face));
