@@ -17,7 +17,7 @@ use crate::video::VideoMeta;
 pub(crate) struct Meta {
     /// Width and height with EXIF orientation applied.
     pub dimensions: Option<(u32, u32)>,
-    /// EXIF `DateTimeOriginal` as `%Y-%m-%dT%H:%M:%S`.
+    /// EXIF `DateTimeOriginal` as `%Y-%m-%dT%H:%M:%S`; the writer falls back to [`stem_taken_at`].
     pub taken_at: Option<String>,
     pub duration_ms: Option<u64>,
     pub codec: Option<String>,
@@ -32,6 +32,15 @@ impl From<VideoMeta> for Meta {
             codec: video.codec,
         }
     }
+}
+
+/// Midnight of a `YYYY-MM-DD` file name prefix, for files whose metadata has no capture time.
+pub(crate) fn stem_taken_at(path: &Path) -> Option<String> {
+    let stem = path.file_stem()?.to_str()?;
+    Some(format!(
+        "{}T00:00:00",
+        crate::geo::events::day_prefix(stem)?
+    ))
 }
 
 /// `None` once `cancel` is set, checked between chunks.
@@ -154,6 +163,26 @@ fn taken_at(exif: &exif::Exif) -> Option<String> {
             t.year, t.month, t.day, t.hour, t.minute, t.second
         )
     })
+}
+
+#[cfg(test)]
+mod stem_tests {
+    use super::*;
+
+    #[test]
+    fn stem_date_is_midnight_of_the_prefix() {
+        assert_eq!(
+            stem_taken_at(Path::new("/l/2024/2024-07-28_00023.jpg")).as_deref(),
+            Some("2024-07-28T00:00:00")
+        );
+        for name in [
+            "IMG-20240728-WA0006.jpg",
+            "2024-02-30_00001.jpg",
+            "2024-07-281.jpg",
+        ] {
+            assert_eq!(stem_taken_at(Path::new(name)), None, "{name}");
+        }
+    }
 }
 
 /// JPEGs with a hand-built little-endian EXIF block, spliced into the `jpeg.jpg` fixture.

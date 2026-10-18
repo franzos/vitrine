@@ -6,7 +6,7 @@ use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension};
 
 use super::faces::ModelId;
-use super::images::{Entry, ImageId, entry_from_row, prefix_range};
+use super::images::{ENTRY_ORDER, Entry, ImageId, entry_from_row, prefix_range};
 use super::people::PersonId;
 use crate::db::{Result, Sha256, path_str};
 
@@ -88,7 +88,7 @@ const COORD_JOINS: &str = " LEFT JOIN locations ml ON ml.sha256 = i.sha256
 const LAT: &str = "CASE WHEN ml.source = 'manual' THEN mp.lat ELSE gs.lat END";
 const LON: &str = "CASE WHEN ml.source = 'manual' THEN mp.lon ELSE gs.lon END";
 
-/// Any depth below `folder`, path order.
+/// Any depth below `folder`, in [`ENTRY_ORDER`].
 pub fn entries(conn: &Connection, folder: &Path, filter: &Filter) -> Result<Vec<Entry>> {
     let (sql, params) = entries_sql(folder, filter)?;
     let mut stmt = conn.prepare(&sql)?;
@@ -100,7 +100,7 @@ fn entries_sql(folder: &Path, filter: &Filter) -> Result<(String, Vec<Value>)> {
     let (from, params) = base(folder, filter, false)?;
     Ok((
         format!(
-            "SELECT i.id, i.path, i.sha256, i.kind, i.width, i.height, i.duration_ms {from} ORDER BY i.path"
+            "SELECT i.id, i.path, i.sha256, i.kind, i.width, i.height, i.duration_ms {from} ORDER BY {ENTRY_ORDER}"
         ),
         params,
     ))
@@ -311,6 +311,39 @@ mod tests {
             place: PlaceSel::default(),
             area: None,
         }
+    }
+
+    #[test]
+    fn entries_sort_by_capture_time_then_path_with_undated_last() {
+        let (_dir, conn) = temp();
+        for (path, kind, taken_at) in [
+            ("/p/IMG_1.jpg", Kind::Image, Some("2024-05-01T12:00:00")),
+            ("/p/IMG_2.jpg", Kind::Image, None),
+            ("/p/IMG_3.jpg", Kind::Image, Some("2024-05-01T08:00:00")),
+            ("/p/VID_1.mp4", Kind::Video, Some("2024-05-01T10:00:00")),
+            ("/p/VID_2.mp4", Kind::Video, None),
+        ] {
+            image(&conn, path, None, kind);
+            conn.execute(
+                "UPDATE images SET taken_at = ?1 WHERE path = ?2",
+                (taken_at, path),
+            )
+            .unwrap();
+        }
+        let all = Filter {
+            model: None,
+            ..filter(ModelId(0))
+        };
+        assert_eq!(
+            names(&conn, "/p", &all),
+            [
+                "IMG_3.jpg",
+                "VID_1.mp4",
+                "IMG_1.jpg",
+                "IMG_2.jpg",
+                "VID_2.mp4"
+            ]
+        );
     }
 
     fn names(conn: &Connection, folder: &str, filter: &Filter) -> Vec<String> {
@@ -716,7 +749,7 @@ mod tests {
                 faces_sql(&mut sql, &mut params, model, filter);
             }
             place_sql(&mut sql, &mut params, &filter.place);
-            sql.push_str(" ORDER BY i.path");
+            sql.push_str(&format!(" ORDER BY {ENTRY_ORDER}"));
             (sql, params)
         };
         let full = Filter {

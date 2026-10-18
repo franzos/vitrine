@@ -8,7 +8,7 @@ use rusqlite::{Connection, Transaction};
 
 use super::faces::Scan;
 use super::geo;
-use super::meta::Meta;
+use super::meta::{self, Meta};
 use super::{Failure, IndexEvent};
 use crate::catalog::faces::{self, NewFace, Rect};
 use crate::catalog::images::{self, Image, ImageId, Kind, NewImage, Status};
@@ -100,6 +100,20 @@ impl<'c, F: FnMut(&IndexEvent)> Writer<'c, F> {
         self.flush(&mut batch)?;
         // senders stop early on cancel, so a hang-up doesn't mean everything was sent
         Ok(!self.cancel.load(Ordering::Relaxed))
+    }
+
+    /// Dates undated rows from their file name; the count written.
+    pub(crate) fn backfill_stem_dates(&mut self) -> Result<u64> {
+        let tx = self.conn.transaction()?;
+        let mut written = 0;
+        for (id, path) in images::undated(&tx)? {
+            if let Some(taken_at) = meta::stem_taken_at(&path) {
+                images::set_taken_at(&tx, id, &taken_at)?;
+                written += 1;
+            }
+        }
+        tx.commit()?;
+        Ok(written)
     }
 
     pub(crate) fn mark_vanished(&mut self) -> Result<()> {
@@ -297,6 +311,11 @@ fn apply_stored(
         return Ok(());
     }
     let (width, height) = stored.meta.dimensions.unzip();
+    let taken_at = stored
+        .meta
+        .taken_at
+        .clone()
+        .or_else(|| meta::stem_taken_at(&stored.path));
     let id = images::upsert(
         conn,
         &NewImage {
@@ -307,7 +326,7 @@ fn apply_stored(
             kind: stored.kind,
             width,
             height,
-            taken_at: stored.meta.taken_at.as_deref(),
+            taken_at: taken_at.as_deref(),
             duration_ms: stored.meta.duration_ms,
             codec: stored.meta.codec.as_deref(),
         },

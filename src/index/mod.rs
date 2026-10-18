@@ -325,6 +325,7 @@ fn run_with(
         return Err(Error::Cancelled);
     }
     writer.mark_vanished()?;
+    writer.backfill_stem_dates()?;
 
     match stage {
         Stage::Off => {}
@@ -1259,6 +1260,49 @@ mod tests {
             .query_row("SELECT count(*) FROM locations", [], |r| r.get(0))
             .unwrap();
         assert_eq!(located, 0);
+    }
+
+    #[test]
+    fn undated_files_take_the_date_from_their_name() {
+        fn taken_at(paths: &Paths, path: &Path) -> Option<String> {
+            let conn = catalog::open(&paths.catalog_db()).unwrap();
+            images::get_by_path(&conn, path).unwrap().unwrap().taken_at
+        }
+        let (_dir, paths, tree) = setup();
+        let roots = [tree.clone()];
+        run(&paths, &roots, &off(), &AtomicBool::new(false), |_| {}).unwrap();
+        let conn = catalog::open(&paths.catalog_db()).unwrap();
+        let png = images::get_by_path(&conn, &tree.join("png.png"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(png.taken_at, None);
+        let dated = tree.join("2020-05-07_00002.png");
+        let invalid = tree.join("2021-13-01_00001.jpg");
+        fs::rename(tree.join("png.png"), &dated).unwrap();
+        fs::copy(tree.join("jpeg.jpg"), &invalid).unwrap();
+        images::set_taken_at(&conn, png.id, "2022-01-01T10:00:00").unwrap();
+        drop(conn);
+
+        run(&paths, &roots, &off(), &AtomicBool::new(false), |_| {}).unwrap();
+        // a moved row keeps its date; a new file without EXIF is dated from its name
+        assert_eq!(
+            taken_at(&paths, &dated).as_deref(),
+            Some("2022-01-01T10:00:00")
+        );
+        assert_eq!(taken_at(&paths, &invalid), None);
+        catalog::open(&paths.catalog_db())
+            .unwrap()
+            .execute("UPDATE images SET taken_at = NULL", [])
+            .unwrap();
+
+        // rows indexed before the fallback are dated without rehashing
+        let (summary, _) = run_events(&paths, &roots);
+        assert_eq!(summary.stats.hashed, 0);
+        assert_eq!(
+            taken_at(&paths, &dated).as_deref(),
+            Some("2020-05-07T00:00:00")
+        );
+        assert_eq!(taken_at(&paths, &invalid), None);
     }
 
     #[test]

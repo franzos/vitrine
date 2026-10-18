@@ -2620,8 +2620,8 @@ mod tests {
             "a/jpeg.jpg",
             "a/png.png",
             "a/webp.webp",
-            "b/avif.avif",
             "b/heic.heic",
+            "b/avif.avif",
         ];
         let prompt = "Apply Lisbon to 2 more images from this event?";
 

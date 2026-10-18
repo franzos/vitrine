@@ -136,6 +136,27 @@ pub fn set_status(conn: &Connection, id: ImageId, status: Status) -> Result<()> 
     Ok(())
 }
 
+pub fn set_taken_at(conn: &Connection, id: ImageId, taken_at: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE images SET taken_at = ?2 WHERE id = ?1",
+        params![id.0, taken_at],
+    )?;
+    Ok(())
+}
+
+/// Active rows without a capture time.
+pub fn undated(conn: &Connection) -> Result<Vec<(ImageId, PathBuf)>> {
+    let mut stmt =
+        conn.prepare("SELECT id, path FROM images WHERE taken_at IS NULL AND status = 'active'")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            ImageId(row.get(0)?),
+            PathBuf::from(row.get::<_, String>(1)?),
+        ))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
 pub fn relink(conn: &Connection, id: ImageId, path: &Path, size: u64, mtime_ns: i64) -> Result<()> {
     conn.execute(
         "UPDATE images SET path = ?2, size = ?3, mtime_ns = ?4, status = 'active' WHERE id = ?1",
@@ -170,23 +191,26 @@ pub struct Entry {
     pub duration_ms: Option<u64>,
 }
 
+/// Grid order over `images i`: capture time, then path; undated content last.
+pub(crate) const ENTRY_ORDER: &str = "i.taken_at IS NULL, i.taken_at, i.path";
+
 pub fn entries_under(conn: &Connection, folder: &Path) -> Result<Vec<Entry>> {
     let (lower, upper) = prefix_range(path_str(folder)?);
-    let mut stmt = conn.prepare(
-        "SELECT id, path, sha256, kind, width, height, duration_ms FROM images
-         WHERE path >= ?1 AND path < ?2 AND status = 'active' ORDER BY path",
-    )?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT i.id, i.path, i.sha256, i.kind, i.width, i.height, i.duration_ms FROM images i
+         WHERE i.path >= ?1 AND i.path < ?2 AND i.status = 'active' ORDER BY {ENTRY_ORDER}"
+    ))?;
     let rows = stmt.query_map([lower, upper], entry_from_row)?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
-/// Active rows among `ids`, path order.
+/// Active rows among `ids`, in [`ENTRY_ORDER`].
 pub fn entries_by_id(conn: &Connection, ids: &[ImageId]) -> Result<Vec<Entry>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "SELECT i.id, i.path, i.sha256, i.kind, i.width, i.height, i.duration_ms
          FROM json_each(?1) j JOIN images i ON i.id = j.value
-         WHERE i.status = 'active' ORDER BY i.path",
-    )?;
+         WHERE i.status = 'active' ORDER BY {ENTRY_ORDER}"
+    ))?;
     let rows = stmt.query_map([id_array(ids)], entry_from_row)?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
@@ -510,7 +534,7 @@ mod tests {
     }
 
     #[test]
-    fn entries_by_id_keeps_active_rows_in_path_order() {
+    fn entries_by_id_keeps_active_rows_in_order() {
         let (_dir, conn) = temp();
         let ids: Vec<_> = ["/q/b.jpg", "/p/z.jpg", "/p/gone.jpg", "/p/a.jpg"]
             .into_iter()

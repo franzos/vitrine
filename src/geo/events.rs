@@ -80,13 +80,18 @@ fn timed(s: &str) -> Option<i64> {
     Some(days * 86_400 + h * 3600 + m * 60 + sec)
 }
 
-/// A `YYYY-MM-DD` prefix not followed by another digit.
-fn day(stem: &str) -> Option<i64> {
+/// A valid `YYYY-MM-DD` prefix not followed by another digit.
+#[must_use]
+pub fn day_prefix(stem: &str) -> Option<&str> {
     let b = stem.as_bytes();
     if b.len() < 10 || b.get(10).is_some_and(u8::is_ascii_digit) {
         return None;
     }
-    date(&b[..10])
+    date(&b[..10]).map(|_| &stem[..10])
+}
+
+fn day(stem: &str) -> Option<i64> {
+    date(day_prefix(stem)?.as_bytes())
 }
 
 fn date(b: &[u8]) -> Option<i64> {
