@@ -1160,10 +1160,14 @@ impl eframe::App for VitrineApp {
 /// Opens the viewer window on `roots` and blocks until it's closed.
 pub fn run(paths: &Paths, roots: &[PathBuf], config: &config::Config) -> anyhow::Result<()> {
     let app = VitrineApp::new(paths, roots, config);
+    let icon =
+        eframe::icon_data::from_png_bytes(include_bytes!("../../assets/com.gofranz.vitrine.png"))?;
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("vitrine")
-            .with_app_id("vitrine")
+            // must match the .desktop file name, so Wayland compositors pick up its icon
+            .with_app_id("com.gofranz.vitrine")
+            .with_icon(icon)
             .with_inner_size([1280.0, 800.0]),
         ..Default::default()
     };

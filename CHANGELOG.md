@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.1.2] - 2026-10-25
+
+### Added
+- Menu entry and app icon
+- Name, assign and ignore faces from the info panel
+
+### Fixed
+- Grid sorts by capture time, falling back to the file name date
+
 ## [0.1.1] - 2026-10-12
 
 ### Added

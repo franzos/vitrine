@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2f3b4c"/>
+      <stop offset="1" stop-color="#1b2330"/>
+    </linearGradient>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#7cc4e8"/>
+      <stop offset="1" stop-color="#d9eef7"/>
+    </linearGradient>
+    <clipPath id="photo">
+      <rect x="56" y="52" width="144" height="120" rx="6"/>
+    </clipPath>
+  </defs>
+  <rect x="8" y="8" width="240" height="240" rx="52" fill="url(#bg)"/>
+  <!-- case frame -->
+  <rect x="40" y="36" width="176" height="152" rx="14" fill="#e9e3d6"/>
+  <!-- photo -->
+  <g clip-path="url(#photo)">
+    <rect x="56" y="52" width="144" height="120" fill="url(#sky)"/>
+    <circle cx="160" cy="88" r="15" fill="#f6c14b"/>
+    <path d="M48 172 L104 104 L136 142 L156 120 L208 172 Z" fill="#3e7d5a"/>
+    <path d="M104 104 L118 121 L110 118 L100 126 L92 119 Z" fill="#f4f7f5"/>
+  </g>
+  <!-- glass reflection -->
+  <path d="M56 52 L104 52 L56 112 Z" fill="#ffffff" opacity="0.28"/>
+  <path d="M116 52 L132 52 L56 148 L56 128 Z" fill="#ffffff" opacity="0.18"/>
+  <!-- plinth -->
+  <rect x="28" y="196" width="200" height="20" rx="8" fill="#c9a86a"/>
+  <rect x="28" y="196" width="200" height="6" rx="3" fill="#e2c78f"/>
+</svg>

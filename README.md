@@ -150,6 +150,8 @@ guix shell -m manifest.scm -- cargo test
 
 If your distro ships older libheif or libjpeg-turbo, `cargo build --release --features vendored` builds both from source and links them statically. That needs `cmake` and `nasm`, plus the libde265 and dav1d headers for HEIC and AVIF. The release packages are built this way.
 
+For a menu entry, copy `assets/com.gofranz.vitrine.desktop` to `~/.local/share/applications/` and `assets/com.gofranz.vitrine.svg` to `~/.local/share/icons/hicolor/scalable/apps/`. The `.deb` installs both.
+
 Guix's Rust 1.95 ships without rustfmt, clippy and rustdoc, so doctests are off and `cargo fmt` / `cargo clippy` need a separate toolchain.
 
 ## License

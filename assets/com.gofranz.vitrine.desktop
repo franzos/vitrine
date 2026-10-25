@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Vitrine
+GenericName=Photo Viewer
+Comment=Browse a dated photo folder tree by place, date and face
+Exec=vitrine
+Icon=com.gofranz.vitrine
+Terminal=false
+Categories=Graphics;Photography;Viewer;
+Keywords=photos;images;gallery;catalog;faces;map;
+StartupWMClass=com.gofranz.vitrine
