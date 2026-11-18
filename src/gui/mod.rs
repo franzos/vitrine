@@ -11,6 +11,7 @@ mod map;
 mod mini_map;
 mod people_panel;
 mod place_picker;
+mod portal;
 mod search_pick;
 mod tree;
 mod viewer;

@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.1.4] - 2026-11-18
+
+### Changed
+- "Show in file manager" goes through the desktop portal
+- Viewer or player not installed: the default app opens the file
+
 ## [0.1.3] - 2026-11-18
 
 ### Changed

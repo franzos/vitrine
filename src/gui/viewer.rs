@@ -1,4 +1,3 @@
-use std::fmt::Write as _;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -18,6 +17,7 @@ use super::grid::Grid;
 use super::info_panel::{self, Info};
 use super::people_panel::Edit;
 use super::place_picker::{Pick, PlacePicker};
+use super::portal;
 use crate::catalog::faces;
 use crate::catalog::geo::Location;
 use crate::catalog::images::{Entry, ImageId, Kind};
@@ -319,10 +319,10 @@ impl Viewer {
             };
         }
         if external {
-            self.open_external(nav);
+            self.open_external(ui.ctx(), nav);
         }
         if play && let Some(entry) = nav.current().filter(|e| e.kind == Kind::Video) {
-            self.message = Self::launch(&self.player, vec![entry.path.clone()]);
+            self.launch(ui.ctx(), self.player.clone(), vec![entry.path.clone()]);
         }
         close
     }
@@ -516,13 +516,13 @@ impl Viewer {
             },
         );
         if external {
-            self.open_external(nav);
+            self.open_external(ui.ctx(), nav);
         }
         if show {
             self.show_in_file_manager(ui.ctx(), entry);
         }
         if play {
-            self.message = Self::launch(&self.player, vec![entry.path.clone()]);
+            self.launch(ui.ctx(), self.player.clone(), vec![entry.path.clone()]);
         }
     }
 
@@ -550,33 +550,48 @@ impl Viewer {
         );
     }
 
-    fn open_external(&mut self, nav: &NavSet) {
-        self.message = Self::launch(&self.external, external_paths(nav));
+    fn open_external(&mut self, ctx: &egui::Context, nav: &NavSet) {
+        self.launch(ctx, self.external.clone(), external_paths(nav));
     }
 
-    /// Runs `argv` with `paths` appended; the error message, if any, for the message line.
-    fn launch(argv: &[String], paths: Vec<PathBuf>) -> Option<String> {
-        spawn_external(argv, paths)
-            .err()
-            .map(|e| format!("cannot run {}: {e}", argv.join(" ")))
+    /// Runs `argv` with `paths` appended. When a command looked up in `PATH` isn't there, as inside a sandbox, the desktop's default app opens the first path.
+    fn launch(&mut self, ctx: &egui::Context, argv: Vec<String>, paths: Vec<PathBuf>) {
+        let first = paths.first().cloned();
+        let in_path = argv.first().is_some_and(|program| !program.contains('/'));
+        self.message = match (spawn_external(&argv, paths), first) {
+            (Ok(()), _) => None,
+            (Err(e), Some(path)) if in_path && e.kind() == io::ErrorKind::NotFound => {
+                self.in_background(ctx, "cannot open", move || portal::open_file(&path))
+            }
+            (Err(e), _) => Some(format!("cannot run {}: {e}", argv.join(" "))),
+        };
     }
 
-    /// On a thread, since a file manager may take a moment to answer.
     fn show_in_file_manager(&mut self, ctx: &egui::Context, entry: &Entry) {
         let path = entry.path.clone();
+        self.message =
+            self.in_background(ctx, "cannot show in file manager", move || reveal(&path));
+    }
+
+    /// Runs `task` on a thread, since the portal or a file manager may take a moment to answer; its error lands on the message line.
+    fn in_background(
+        &self,
+        ctx: &egui::Context,
+        what: &'static str,
+        task: impl FnOnce() -> io::Result<()> + Send + 'static,
+    ) -> Option<String> {
         let notices = self.notices.0.clone();
         let ctx = ctx.clone();
-        let spawned = thread::Builder::new()
-            .name("reveal".to_owned())
+        thread::Builder::new()
+            .name("open".to_owned())
             .spawn(move || {
-                if let Err(e) = reveal(&path) {
-                    _ = notices.send(format!("cannot show in file manager: {e}"));
+                if let Err(e) = task() {
+                    _ = notices.send(format!("{what}: {e}"));
                     ctx.request_repaint();
                 }
-            });
-        self.message = spawned
+            })
             .err()
-            .map(|e| format!("cannot show in file manager: {e}"));
+            .map(|e| format!("{what}: {e}"))
     }
 }
 
@@ -616,25 +631,9 @@ fn detach(mut child: Child) -> io::Result<()> {
     Ok(())
 }
 
-/// Selects `path` in the file manager via the freedesktop `FileManager1` D-Bus interface; falls back to `xdg-open` on its folder.
+/// Selects `path` in the file manager through the desktop portal; falls back to `xdg-open` on its folder.
 fn reveal(path: &Path) -> io::Result<()> {
-    let shown = Command::new("dbus-send")
-        .args([
-            "--session",
-            "--print-reply",
-            "--reply-timeout=5000",
-            "--dest=org.freedesktop.FileManager1",
-            "/org/freedesktop/FileManager1",
-            "org.freedesktop.FileManager1.ShowItems",
-        ])
-        .arg(format!("array:string:{}", file_uri(path)))
-        .arg("string:")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success());
-    if shown {
+    if portal::open_directory(path).is_ok() {
         return Ok(());
     }
     let folder = path
@@ -648,19 +647,6 @@ fn reveal(path: &Path) -> io::Result<()> {
         .stderr(Stdio::null())
         .spawn()?;
     detach(child)
-}
-
-/// Percent-encodes all but unreserved characters and `/`; dbus-send splits array values on commas.
-fn file_uri(path: &Path) -> String {
-    let mut uri = String::from("file://");
-    for &byte in path.as_os_str().as_encoded_bytes() {
-        if byte.is_ascii_alphanumeric() || b"/-._~".contains(&byte) {
-            uri.push(char::from(byte));
-        } else {
-            let _ = write!(uri, "%{byte:02X}");
-        }
-    }
-    uri
 }
 
 /// The frame's pinch zoom combined with vertical scrolling.
@@ -808,14 +794,6 @@ mod tests {
             PathBuf::from(format!("/p/{}", 2 + EXTERNAL_WINDOW + 5))
         );
         assert_eq!(paths[paths.len() - 1], PathBuf::from("/p/1"));
-    }
-
-    #[test]
-    fn file_uri_percent_encodes_everything_but_the_path_characters() {
-        assert_eq!(
-            file_uri(Path::new("/a b/c,d/é~x.jpg")),
-            "file:///a%20b/c%2Cd/%C3%A9~x.jpg"
-        );
     }
 
     #[test]
