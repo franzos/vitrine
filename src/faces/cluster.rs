@@ -1286,7 +1286,7 @@ mod tests {
 
         /// Each image with one labelled person and one counted face must land in that person's single cluster.
         #[test]
-        #[ignore = "needs ORT_DYLIB_PATH, fetched models and VITRINE_FACE_FIXTURES"]
+        #[ignore = "needs fetched models and VITRINE_FACE_FIXTURES"]
         fn fixture_people_form_one_cluster_each() {
             let fixtures = fixtures::load();
             let dir = tempfile::tempdir().unwrap();

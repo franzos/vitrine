@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, ensure};
 use image::RgbImage;
-use ort::value::Tensor;
+use tract_onnx::prelude::{Tensor, tvec};
 
 use super::align::ALIGNED_SIZE;
 use super::fetch::EMBEDDING_DIM;
@@ -34,15 +34,17 @@ impl FaceEmbedder for ArcFace {
         let side = ALIGNED_SIZE as usize;
         let mut out = Vec::with_capacity(aligned.len());
         for chunk in aligned.chunks(BATCH) {
-            let tensor = Tensor::from_array(([chunk.len(), 3, side, side], input_tensor(chunk)?))?;
-            let mut session = self.runtime.embedder();
-            let outputs = session
-                .run(ort::inputs![tensor])
+            let tensor = Tensor::from_shape(&[chunk.len(), 3, side, side], &input_tensor(chunk)?)?;
+            let outputs = self
+                .runtime
+                .embedder()
+                .run(tvec![tensor.into()])
                 .context("embedder inference failed")?;
-            let (shape, data) = outputs[0].try_extract_tensor::<f32>()?;
+            let data = outputs[0].try_as_plain_ram()?.as_slice::<f32>()?;
+            let shape = outputs[0].shape();
             ensure!(
                 data.len() == chunk.len() * EMBEDDING_DIM,
-                "embedder returned {shape}, expected [{}, {EMBEDDING_DIM}]",
+                "embedder returned {shape:?}, expected [{}, {EMBEDDING_DIM}]",
                 chunk.len()
             );
             out.extend(
@@ -197,7 +199,7 @@ mod tests {
 
         /// Same person: single-person images with one counted face. Different: across people, plus faces within a correctly counted image.
         #[test]
-        #[ignore = "needs ORT_DYLIB_PATH, fetched models and VITRINE_FACE_FIXTURES"]
+        #[ignore = "needs fetched models and VITRINE_FACE_FIXTURES"]
         fn fixture_pairs_split_at_cluster_threshold() {
             let (embedded, _) = embed_fixtures();
             let singles: Vec<(&str, &str, &[f32])> = embedded
@@ -253,7 +255,7 @@ mod tests {
         }
 
         #[test]
-        #[ignore = "needs ORT_DYLIB_PATH, fetched models and VITRINE_FACE_FIXTURES"]
+        #[ignore = "needs fetched models and VITRINE_FACE_FIXTURES"]
         fn batched_embeddings_match_single_runs() {
             let fixtures = fixtures::load();
             let runtime = Arc::new(FaceRuntime::new(&fixtures::models_dir(), Device::Cpu).unwrap());

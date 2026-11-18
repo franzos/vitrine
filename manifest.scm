@@ -4,7 +4,6 @@
              (gnu packages commencement)
              (gnu packages tls)
              (gnu packages base)
-             (gnu packages machine-learning)
              (gnu packages image)
              (gnu packages pkg-config)
              (gnu packages gl)
@@ -35,18 +34,6 @@
             (separator #f))
            (package-native-search-paths gcc-toolchain)))))
 
-;; ort loads onnxruntime at runtime (load-dynamic) from ORT_DYLIB_PATH.
-(define onnxruntime-with-dylib-path
-  (package
-    (inherit onnxruntime)
-    (native-search-paths
-     (cons (search-path-specification
-            (variable "ORT_DYLIB_PATH")
-            (files '("lib/libonnxruntime.so"))
-            (file-type 'regular)
-            (separator #f))
-           (package-native-search-paths onnxruntime)))))
-
 ;; eframe dlopens libwayland-client, libxkbcommon and libEGL/libGL at runtime.
 (define mesa-with-library-path
   (package
@@ -64,7 +51,6 @@
        gcc-toolchain-with-cc
        openssl-with-dir
        pkg-config
-       onnxruntime-with-dylib-path
        libjpeg-turbo-3
        libheif
        mesa-with-library-path

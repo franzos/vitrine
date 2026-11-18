@@ -15,7 +15,7 @@ vitrine never touches image files. It keeps a catalog database, a thumbnail cach
 | Binary | Download [`vitrine-x86_64-unknown-linux-gnu.tar.gz`](https://github.com/franzos/vitrine/releases) and put `vitrine` on your `PATH` |
 | Guix, Cargo | See [Building](#building) |
 
-The release builds are Linux x86_64 only and need glibc 2.39 or newer (Ubuntu 24.04, Debian 13). The plain binary also needs libde265 and dav1d installed; the `.deb` pulls them in. For videos, install `ffmpeg`. For faces, you need ONNX Runtime, which isn't packaged (see [Faces](#faces)).
+The release builds are Linux x86_64 only and need glibc 2.39 or newer (Ubuntu 24.04, Debian 13). The plain binary also needs libde265 and dav1d installed; the `.deb` pulls them in. For videos, install `ffmpeg`.
 
 ## Usage
 
@@ -56,7 +56,7 @@ roots = []                  # absolute paths, ~ is expanded
 
 [faces]
 enabled = false
-device = "cpu"              # or "cuda", with a CUDA build of ONNX Runtime
+device = "cpu"              # the only device; inference runs on the CPU
 cluster_threshold = 0.62    # max cosine distance for two faces to be neighbours
 min_neighbours = 2          # neighbours a face needs to start a new person
 merge_threshold = 0.25      # max cosine distance between two people's mean embeddings to merge them
@@ -77,10 +77,11 @@ The catalog, the models and `geo.db` live in `$XDG_DATA_HOME/vitrine/`, thumbnai
 
 Off by default. To turn it on:
 
-1. Point `ORT_DYLIB_PATH` at [ONNX Runtime](https://onnxruntime.ai/) 1.28 or newer.
-2. `vitrine faces fetch`
-3. Set `faces.enabled = true`.
-4. `vitrine index` (or open the GUI).
+1. `vitrine faces fetch`
+2. Set `faces.enabled = true`.
+3. `vitrine index` (or open the GUI).
+
+Inference runs in-process on the CPU through [tract](https://github.com/sonos/tract), so there's no runtime library to install.
 
 **License note:** the models are InsightFace's buffalo_l set. They aren't mine and aren't licensed for commercial use. From the [InsightFace README](https://github.com/deepinsight/insightface#license): "The training data containing the annotation (and the models trained with these data) are available for non-commercial research purposes only." So they're never bundled: `faces fetch` prints that note, downloads them and checks their hashes.
 
@@ -141,7 +142,7 @@ vitrine doesn't read shelf's database; it walks the configured roots again.
 
 ## Building
 
-Needs Rust 1.95+, libheif 1.23+ and libjpeg-turbo 3 (via pkg-config), and at runtime ONNX Runtime 1.28+ for faces and `ffmpeg`/`ffprobe` for videos. On Guix, the manifest provides all of it:
+Needs Rust 1.95+, libheif 1.23+ and libjpeg-turbo 3 (via pkg-config), and at runtime `ffmpeg`/`ffprobe` for videos. On Guix, the manifest provides all of it:
 
 ```bash
 guix shell -m manifest.scm -- cargo build --release

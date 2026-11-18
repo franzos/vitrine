@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.1.3] - 2026-11-18
+
+### Changed
+- Face recognition runs built-in; ONNX Runtime is no longer needed
+- `faces.device = "cuda"` is no longer supported
+
 ## [0.1.2] - 2026-10-25
 
 ### Added

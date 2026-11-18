@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, bail};
 use image::{Rgb, RgbImage};
-use ort::value::Tensor;
+use tract_onnx::prelude::{Tensor, tvec};
 
 use super::align::to_u8;
 use super::model::{Detection, FaceDetector};
@@ -39,14 +39,20 @@ impl FaceDetector for Scrfd {
         };
         let input = input_tensor(&resize_linear(image, width, height));
         let side = INPUT_SIZE as usize;
-        let tensor = Tensor::from_array(([1, 3, side, side], input))?;
+        let tensor = Tensor::from_shape(&[1, 3, side, side], &input)?;
 
-        let mut session = self.runtime.detector();
-        let outputs = session
-            .run(ort::inputs![tensor])
+        let outputs = self
+            .runtime
+            .detector()
+            .run(tvec![tensor.into()])
             .context("detector inference failed")?;
-        let values = (0..outputs.len())
-            .map(|i| outputs[i].try_extract_tensor::<f32>().map(|(_, data)| data))
+        let values = outputs
+            .iter()
+            .map(|value| {
+                value
+                    .try_as_plain_ram()
+                    .and_then(|view| view.as_slice::<f32>())
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let [s8, s16, s32, b8, b16, b32, k8, k16, k32] = values.as_slice() else {
             bail!("detector returned {} outputs, expected 9", values.len());
@@ -59,8 +65,6 @@ impl FaceDetector for Scrfd {
         ] {
             decode_stride(stride, scores, boxes, kps, &mut detections)?;
         }
-        drop(outputs);
-        drop(session);
 
         for detection in &mut detections {
             detection.bbox = detection.bbox.map(|v| v / scale);
@@ -353,7 +357,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs ORT_DYLIB_PATH, fetched models and VITRINE_FACE_FIXTURES"]
+    #[ignore = "needs fetched models and VITRINE_FACE_FIXTURES"]
     fn fixture_face_counts_match_labels() {
         use crate::config::Faces;
         use crate::faces::fixtures;
